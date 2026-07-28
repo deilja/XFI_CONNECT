@@ -2,13 +2,16 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from typing import Optional
 
+from bot.services.broadcast_audience import BROADCAST_FILTER_LABELS
+from database.db_stats import normalize_broadcast_filters
+
 from .admin_misc import back_button, home_button
 
-BROADCAST_FILTERS = {'all': '👤 Все пользователи', 'active': '✅ С активными ключами', 'inactive': '❌ Без активных ключей', 'never_paid': '🆕 Никогда не покупали', 'expired': '🚫 Ключ истёк'}
+BROADCAST_FILTERS = BROADCAST_FILTER_LABELS
 
 def broadcast_main_kb(
     has_message: bool,
-    current_filter: str,
+    current_filters: object,
     broadcast_in_progress: bool,
     user_count: int,
     content_kind: Optional[str] = None,
@@ -18,7 +21,7 @@ def broadcast_main_kb(
     
     Args:
         has_message: Whether there is a saved message
-        current_filter: Current selected filter
+        current_filters: Current selected filter keys
         broadcast_in_progress: Is broadcasting in progress now?
         user_count: Number of users by current filter
     """
@@ -26,11 +29,19 @@ def broadcast_main_kb(
     msg_status = '✅' if has_message else '❌'
     content_label = '📊 Опрос' if content_kind == 'poll' else '✉️ Сообщение'
     builder.row(InlineKeyboardButton(text=f'{content_label}: {msg_status}', callback_data='broadcast_edit_message'), InlineKeyboardButton(text='👁️ Превью', callback_data='broadcast_preview'))
+    selected_filters = set(normalize_broadcast_filters(current_filters))
     for (filter_key, filter_name) in BROADCAST_FILTERS.items():
-        radio = '🔘' if filter_key == current_filter else '⚪'
-        builder.row(InlineKeyboardButton(text=f'{radio} {filter_name}', callback_data=f'broadcast_filter:{filter_key}'))
+        indicator = '🟢' if filter_key in selected_filters else '⚪'
+        builder.row(InlineKeyboardButton(text=f'{indicator} {filter_name}', callback_data=f'broadcast_filter:{filter_key}'))
     if broadcast_in_progress:
         builder.row(InlineKeyboardButton(text='🛑 Остановить рассылку', callback_data='broadcast_stop'))
+    elif user_count <= 0:
+        builder.row(
+            InlineKeyboardButton(
+                text='❌ Нет получателей — рассылка не запустится',
+                callback_data='broadcast_empty_audience',
+            )
+        )
     else:
         builder.row(InlineKeyboardButton(text=f'🚀 Начать рассылку ({user_count} чел.)', callback_data='broadcast_start'))
     builder.row(InlineKeyboardButton(text='─────────────────', callback_data='noop'))

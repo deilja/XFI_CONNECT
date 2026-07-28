@@ -797,6 +797,28 @@ def get_seconds_until(target_hour: int, target_minute: int = 0) -> int:
     return int((target - now).total_seconds())
 
 
+async def run_daily_key_cleanup(bot: Bot) -> tuple[Optional[Any], Optional[Any]]:
+    """Run both daily key cleanups with independent failure isolation."""
+    from bot.services.key_cleanup import (
+        cleanup_expired_database_keys,
+        cleanup_inactive_panel_clients,
+    )
+
+    panel_report = None
+    database_report = None
+    try:
+        panel_report = await cleanup_inactive_panel_clients()
+    except Exception as exc:
+        logger.error("Daily inactive panel-client cleanup failed: %s", exc)
+
+    try:
+        database_report = await cleanup_expired_database_keys(bot)
+    except Exception as exc:
+        logger.error("Daily expired-key database cleanup failed: %s", exc)
+
+    return panel_report, database_report
+
+
 async def run_daily_tasks(bot: Bot) -> None:
     """
     Background task for running daily tasks.
@@ -842,10 +864,26 @@ async def run_daily_tasks(bot: Bot) -> None:
             
             # Sending notifications to users
             await check_and_send_expiry_notifications(bot)
+
+            # Win-back coupons must be processed before expired keys are removed.
+            try:
+                from bot.services.lapsed_coupons import (
+                    process_lapsed_coupon_deliveries,
+                )
+
+                await process_lapsed_coupon_deliveries(bot)
+            except Exception as e:
+                logger.error(
+                    "Daily lapsed-user coupon delivery failed: %s",
+                    e,
+                )
             
             # Monthly traffic reset (1st day of every month)
             if datetime.now().day == 1:
                 await monthly_traffic_reset(bot)
+
+            # Panel cleanup must follow a possible monthly traffic reset.
+            await run_daily_key_cleanup(bot)
             
             # We wait a little so as not to start again at the same minute
             await asyncio.sleep(60)
@@ -1253,14 +1291,15 @@ async def materialize_subscription_state(
     snapshots: Optional[SnapshotCollection] = None,
 ) -> None:
     """
-    Full pass through all active keys with challenge
-    ensure_subscription_keys_on_server() - finishes missing clients
-    in subscription mode and deletes unnecessary ones in keys mode.
+    Full pass through all panel-linked keys.
+
+    Active keys are materialized, while existing inactive clients are disabled
+    and missing inactive clients are deliberately left absent.
 
     Runs once every ~30 minutes (every 6 traffic-sync cycles).
     """
-    from database.requests import get_all_active_keys_with_server
-    keys = list(keys) if keys is not None else get_all_active_keys_with_server()
+    from database.requests import get_all_panel_sync_keys
+    keys = list(keys) if keys is not None else get_all_panel_sync_keys()
     if not keys:
         return
 
@@ -1305,12 +1344,21 @@ async def run_traffic_sync_scheduler(bot: Bot) -> None:
     while True:
         try:
             async with panel_sync_coordinator.regular():
-                from database.requests import get_all_active_keys_with_server
+                from database.requests import (
+                    get_all_active_keys_with_server,
+                    get_all_panel_sync_keys,
+                )
 
                 cycle_keys = get_all_active_keys_with_server()
                 cycle_servers = get_all_servers()
+                materialize_due = (cycle + 1) % 6 == 0
+                materialization_keys = (
+                    get_all_panel_sync_keys()
+                    if materialize_due
+                    else cycle_keys
+                )
                 cycle_snapshots = await collect_server_snapshots(
-                    cycle_keys,
+                    materialization_keys,
                     cycle_servers,
                 )
                 await sync_traffic_stats(
@@ -1327,10 +1375,10 @@ async def run_traffic_sync_scheduler(bot: Bot) -> None:
                     logger.error(f"Ошибка обработки key_expired lifecycle events: {e}")
                 cycle += 1
                 # Reuse the same snapshots every sixth cycle (about 30 minutes).
-                if cycle % 6 == 0:
+                if materialize_due:
                     try:
                         await materialize_subscription_state(
-                            keys=cycle_keys,
+                            keys=materialization_keys,
                             servers=cycle_servers,
                             snapshots=cycle_snapshots,
                         )

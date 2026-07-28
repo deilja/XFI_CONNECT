@@ -4,7 +4,6 @@ Handlers for deleting keys and synchronizing remote keys (admin panel).
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
 import logging
-import json
 
 from bot.utils.text import safe_edit_or_send
 from bot.keyboards.admin_users import (
@@ -25,6 +24,7 @@ from database.requests import (
 )
 from bot.services.vpn_api import get_client_from_server_data
 from bot.services.panel_sync_coordinator import regular_panel_operation
+from bot.utils.panel_email import is_managed_panel_email
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -108,6 +108,13 @@ async def _delete_key_from_panel(key: dict) -> bool:
     """Removes a key from the panel, taking into account subscription keys in all inbound."""
     key_id = key.get('id')
     if not (key.get('server_active') and key.get('host')):
+        return False
+    if not is_managed_panel_email(key.get('panel_email')):
+        logger.warning(
+            "Panel deletion skipped key %s with unmanaged panel_email=%r",
+            key_id,
+            key.get('panel_email'),
+        )
         return False
 
     is_subscription_key = bool(key.get('sub_id') and key.get('panel_email'))
@@ -200,25 +207,38 @@ async def on_sync_deleted_panel_confirm(callback: CallbackQuery):
     for server in servers:
         try:
             client = get_client_from_server_data(server)
-            inbounds = await client.get_inbounds()
-
-            for inbound in inbounds:
-                inbound_id = inbound['id']
-                settings = json.loads(inbound.get('settings', '{}'))
-                clients = settings.get('clients', [])
-
-                for cl in clients:
-                    cl_email = cl.get('email', '')
-                    # Only the keys of our bot (user_*), which are not in the database
-                    if cl_email.lower().startswith('user_') and cl_email.lower() not in db_emails_all:
-                        try:
-                            client_uuid = cl.get('id') or cl.get('password')
-                            await client.delete_client(inbound_id, client_uuid)
+            snapshot = await client.get_sync_snapshot(subscription_mode=True)
+            orphan_emails = sorted(
+                {
+                    state.email
+                    for state in snapshot.clients.values()
+                    if is_managed_panel_email(state.email)
+                    and state.email.lower() not in db_emails_all
+                }
+            )
+            bulk_delete = getattr(client, 'bulk_delete_clients', None)
+            if orphan_emails and callable(bulk_delete):
+                deleted_count += await bulk_delete(orphan_emails)
+            else:
+                for orphan_email in orphan_emails:
+                    try:
+                        deleted = await client.delete_clients_by_email_on_server(
+                            orphan_email
+                        )
+                        if deleted:
                             deleted_count += 1
-                            logger.info(f"Очистка панели: удалён сирота {cl_email} с {server['name']}")
-                        except Exception as e:
-                            logger.error(f"Очистка панели: ошибка удаления {cl_email}: {e}")
-                            errors_count += 1
+                        logger.info(
+                            "Очистка панели: удалён сирота %s с %s",
+                            orphan_email,
+                            server['name'],
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Очистка панели: ошибка удаления %s: %s",
+                            orphan_email,
+                            e,
+                        )
+                        errors_count += 1
 
         except Exception as e:
             logger.error(f"Очистка панели: ошибка связи с {server['name']}: {e}")
@@ -420,13 +440,8 @@ async def on_sync_db_missing_ask(callback: CallbackQuery):
 
     try:
         client = get_client_from_server_data(server)
-        inbounds = await client.get_inbounds()
-
-        panel_emails = set()
-        for inbound in inbounds:
-            settings = json.loads(inbound.get('settings', '{}'))
-            for cl in settings.get('clients', []):
-                panel_emails.add(cl.get('email', '').lower())
+        snapshot = await client.get_sync_snapshot(subscription_mode=True)
+        panel_emails = set(snapshot.clients)
 
         from database.connection import get_db
         with get_db() as conn:
@@ -486,13 +501,8 @@ async def on_sync_db_missing_confirm(callback: CallbackQuery):
 
     try:
         client = get_client_from_server_data(server)
-        inbounds = await client.get_inbounds()
-
-        panel_emails = set()
-        for inbound in inbounds:
-            settings = json.loads(inbound.get('settings', '{}'))
-            for cl in settings.get('clients', []):
-                panel_emails.add(cl.get('email', '').lower())
+        snapshot = await client.get_sync_snapshot(subscription_mode=True)
+        panel_emails = set(snapshot.clients)
 
         from database.connection import get_db
         with get_db() as conn:
@@ -646,13 +656,8 @@ async def _scan_db_keys() -> dict:
 
         try:
             client = get_client_from_server_data(server)
-            inbounds = await client.get_inbounds()
-
-            panel_emails = set()
-            for inbound in inbounds:
-                settings = json.loads(inbound.get('settings', '{}'))
-                for cl in settings.get('clients', []):
-                    panel_emails.add(cl.get('email', '').lower())
+            snapshot = await client.get_sync_snapshot(subscription_mode=True)
+            panel_emails = set(snapshot.clients)
 
             missing = 0
             ok = 0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ from bot.services.panels.base import (
     PanelServerSnapshot,
     build_legacy_panel_snapshot,
 )
+from bot.services.panel_key_state import should_panel_client_exist
+from bot.utils.panel_email import is_managed_panel_email
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +122,26 @@ def group_keys_by_server(
     return grouped
 
 
+def _managed_keys(
+    keys: Iterable[Dict[str, Any]],
+    *,
+    operation: str,
+) -> List[Dict[str, Any]]:
+    """Return only bot-owned key rows and report invalid ownership boundaries."""
+    managed: List[Dict[str, Any]] = []
+    for key in keys:
+        if is_managed_panel_email(key.get("panel_email")):
+            managed.append(key)
+            continue
+        logger.warning(
+            "%s skipped key %s with unmanaged panel_email=%r",
+            operation,
+            key.get("id"),
+            key.get("panel_email"),
+        )
+    return managed
+
+
 async def collect_server_snapshots(
     keys: Iterable[Dict[str, Any]],
     servers: Iterable[Dict[str, Any]],
@@ -136,62 +159,277 @@ async def collect_server_snapshots(
         else None
     )
     collection = SnapshotCollection()
+    semaphore = asyncio.Semaphore(4)
 
-    for server_id in grouped:
+    async def collect_one(server_id: int) -> None:
         if allowed is not None and server_id not in allowed:
-            continue
+            return
         server = servers_by_id.get(server_id)
         if not server:
             collection.errors[server_id] = "Server is missing or disabled"
-            continue
-        try:
-            client = get_client_from_server_data(server)
-            subscription_mode = is_subscription_mode()
-            snapshot_method = getattr(client, "get_sync_snapshot", None)
-            if callable(snapshot_method):
-                snapshot_result = snapshot_method(
-                    subscription_mode=subscription_mode,
+            return
+        async with semaphore:
+            try:
+                client = get_client_from_server_data(server)
+                subscription_mode = is_subscription_mode()
+                snapshot_method = getattr(client, "get_sync_snapshot", None)
+                if callable(snapshot_method):
+                    snapshot_result = snapshot_method(
+                        subscription_mode=subscription_mode,
+                    )
+                    snapshot = (
+                        await snapshot_result
+                        if inspect.isawaitable(snapshot_result)
+                        else snapshot_result
+                    )
+                else:
+                    # Keep third-party/older adapters and lightweight test doubles
+                    # compatible: their complete inbound list is already a valid
+                    # one-request legacy snapshot.
+                    inbounds_method = (
+                        getattr(client, "get_subscription_inbounds", None)
+                        if subscription_mode
+                        else None
+                    ) or getattr(client, "get_inbounds", None)
+                    if not callable(inbounds_method):
+                        raise RuntimeError("Panel adapter does not support batch snapshots")
+                    try:
+                        inbounds_result = inbounds_method(include_ignored=True)
+                    except TypeError:
+                        inbounds_result = inbounds_method()
+                    inbounds = (
+                        await inbounds_result
+                        if inspect.isawaitable(inbounds_result)
+                        else inbounds_result
+                    )
+                    snapshot = build_legacy_panel_snapshot(
+                        list(inbounds or []),
+                    )
+                if not isinstance(snapshot, PanelServerSnapshot):
+                    raise RuntimeError("Panel adapter returned an invalid batch snapshot")
+                collection.snapshots[server_id] = snapshot
+            except Exception as exc:
+                collection.errors[server_id] = str(exc)
+                logger.warning(
+                    "Batch panel snapshot failed for server %s (%s): %s",
+                    server.get("name", server_id),
+                    server_id,
+                    exc,
                 )
-                snapshot = (
-                    await snapshot_result
-                    if inspect.isawaitable(snapshot_result)
-                    else snapshot_result
+
+    await asyncio.gather(*(collect_one(server_id) for server_id in grouped))
+    return collection
+
+
+async def _apply_clients_api_bulk_prelude(
+    server: Dict[str, Any],
+    server_keys: Iterable[Dict[str, Any]],
+    snapshot: PanelServerSnapshot,
+) -> Dict[str, Dict[str, int]]:
+    """Batch membership and enabled-state changes before point reconciliation."""
+    if snapshot.api_profile != "clients_api":
+        return {}
+
+    from bot.services.vpn_api import (
+        get_client_from_server_data,
+        is_subscription_mode,
+    )
+    from bot.utils.inbounds import is_ignored_inbound
+
+    client = get_client_from_server_data(server)
+    required_methods = (
+        "bulk_attach_clients",
+        "bulk_detach_clients",
+        "bulk_delete_clients",
+        "bulk_set_clients_enabled",
+    )
+    if not all(
+        callable(getattr(type(client), method_name, None))
+        for method_name in required_methods
+    ):
+        return {}
+
+    per_email: Dict[str, Dict[str, int]] = {}
+
+    def stats_for(email: str) -> Dict[str, int]:
+        return per_email.setdefault(email.strip().lower(), empty_panel_stats())
+
+    visible_ids = {
+        int(inbound["id"])
+        for inbound in snapshot.inbounds
+        if inbound.get("id") is not None and not is_ignored_inbound(inbound)
+    }
+    subscription_mode = is_subscription_mode()
+    attach_groups: Dict[tuple[int, ...], List[str]] = {}
+    detach_groups: Dict[tuple[int, ...], List[str]] = {}
+    delete_emails: List[str] = []
+    enable_emails: List[str] = []
+    disable_emails: List[str] = []
+    states_by_email: Dict[str, PanelClientState] = {}
+    seen_emails: set[str] = set()
+
+    for key in server_keys:
+        email = str(key.get("panel_email") or "").strip()
+        if not is_managed_panel_email(email):
+            logger.warning(
+                "Clients API bulk prelude skipped key %s with unmanaged "
+                "panel_email=%r",
+                key.get("id"),
+                key.get("panel_email"),
+            )
+            continue
+        normalized_email = email.lower()
+        if not normalized_email or normalized_email in seen_emails:
+            continue
+        seen_emails.add(normalized_email)
+        active = should_panel_client_exist(key)
+        state = snapshot.get_client(email)
+        if state is None:
+            continue
+        states_by_email[normalized_email] = state
+
+        if not active:
+            if bool(state.enable):
+                disable_emails.append(email)
+            continue
+
+        current_ids = set(state.inbound_ids)
+
+        if subscription_mode:
+            desired_ids = set(visible_ids)
+        else:
+            try:
+                configured_id = int(key.get("panel_inbound_id"))
+            except (TypeError, ValueError):
+                configured_id = None
+            current_visible = current_ids.intersection(visible_ids)
+            if configured_id in visible_ids:
+                desired_ids = {configured_id}
+            elif current_visible:
+                desired_ids = {min(current_visible)}
+            else:
+                desired_ids = set()
+
+        if not desired_ids and current_ids:
+            delete_emails.append(email)
+            continue
+
+        missing_ids = tuple(sorted(desired_ids - current_ids))
+        extra_ids = tuple(sorted(current_ids - desired_ids))
+        if missing_ids:
+            attach_groups.setdefault(missing_ids, []).append(email)
+        if extra_ids:
+            detach_groups.setdefault(extra_ids, []).append(email)
+
+        if bool(state.enable) != bool(active):
+            (enable_emails if active else disable_emails).append(email)
+
+    operation_metrics = client.operation_metrics("bulk_reconcile")
+    async with operation_metrics:
+        for inbound_ids, emails in attach_groups.items():
+            known_states = {
+                email: states_by_email[email.lower()]
+                for email in emails
+                if email.lower() in states_by_email
+            }
+            try:
+                confirmed = await client.bulk_attach_clients(
+                    emails,
+                    inbound_ids,
+                    known_states=known_states,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Bulk attach failed for server %s: %s",
+                    server.get("id"),
+                    exc,
+                )
+                continue
+            confirmed_keys = {email.lower() for email in confirmed}
+            for email in emails:
+                if email.lower() not in confirmed_keys:
+                    continue
+                state = states_by_email[email.lower()]
+                state.inbound_ids.update(inbound_ids)
+                for inbound_id in inbound_ids:
+                    state.placements[inbound_id] = dict(state.client)
+                stats_for(email)["created"] += len(inbound_ids)
+
+        for inbound_ids, emails in detach_groups.items():
+            try:
+                confirmed = await client.bulk_detach_clients(
+                    emails,
+                    inbound_ids,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Bulk detach failed for server %s: %s",
+                    server.get("id"),
+                    exc,
+                )
+                continue
+            confirmed_keys = {email.lower() for email in confirmed}
+            for email in emails:
+                if email.lower() not in confirmed_keys:
+                    continue
+                state = states_by_email[email.lower()]
+                for inbound_id in inbound_ids:
+                    state.inbound_ids.discard(inbound_id)
+                    state.placements.pop(inbound_id, None)
+                stats_for(email)["deleted"] += len(inbound_ids)
+
+        if delete_emails:
+            try:
+                await client.bulk_delete_clients(delete_emails)
+            except Exception as exc:
+                logger.warning(
+                    "Bulk delete failed for server %s: %s",
+                    server.get("id"),
+                    exc,
                 )
             else:
-                # Keep third-party/older adapters and lightweight test doubles
-                # compatible: their complete inbound list is already a valid
-                # one-request legacy snapshot.
-                inbounds_method = (
-                    getattr(client, "get_subscription_inbounds", None)
-                    if subscription_mode
-                    else None
-                ) or getattr(client, "get_inbounds", None)
-                if not callable(inbounds_method):
-                    raise RuntimeError("Panel adapter does not support batch snapshots")
-                try:
-                    inbounds_result = inbounds_method(include_ignored=True)
-                except TypeError:
-                    inbounds_result = inbounds_method()
-                inbounds = (
-                    await inbounds_result
-                    if inspect.isawaitable(inbounds_result)
-                    else inbounds_result
+                for email in delete_emails:
+                    state = states_by_email[email.lower()]
+                    stats_for(email)["deleted"] += max(
+                        1,
+                        len(state.inbound_ids),
+                    )
+                    snapshot.clients.pop(email.lower(), None)
+
+        for target_enable, emails in (
+            (True, enable_emails),
+            (False, disable_emails),
+        ):
+            if not emails:
+                continue
+            try:
+                changed = await client.bulk_set_clients_enabled(
+                    emails,
+                    target_enable,
                 )
-                snapshot = build_legacy_panel_snapshot(
-                    list(inbounds or []),
+            except Exception as exc:
+                logger.warning(
+                    "Bulk %s failed for server %s: %s",
+                    "enable" if target_enable else "disable",
+                    server.get("id"),
+                    exc,
                 )
-            if not isinstance(snapshot, PanelServerSnapshot):
-                raise RuntimeError("Panel adapter returned an invalid batch snapshot")
-            collection.snapshots[server_id] = snapshot
-        except Exception as exc:
-            collection.errors[server_id] = str(exc)
-            logger.warning(
-                "Batch panel snapshot failed for server %s (%s): %s",
-                server.get("name", server_id),
-                server_id,
-                exc,
-            )
-    return collection
+                continue
+            if changed < len(emails):
+                # Without a per-email success list, leave the snapshot unchanged.
+                # Point reconciliation remains the authoritative fallback.
+                continue
+            for email in emails:
+                state = states_by_email[email.lower()]
+                placement_count = max(1, len(state.inbound_ids))
+                state.enable = target_enable
+                state.client["enable"] = target_enable
+                for placement in state.placements.values():
+                    placement["enable"] = target_enable
+                field = "enabled" if target_enable else "disabled"
+                stats_for(email)[field] += placement_count
+
+    return per_email
 
 
 def normalized_traffic_for_key(
@@ -352,11 +590,11 @@ async def build_panel_to_db_plan(
         if candidate_key_ids is not None
         else None
     )
-    selected_keys = [
+    selected_keys = _managed_keys([
         key
         for key in keys
         if selected_ids is None or int(key.get("id", 0)) in selected_ids
-    ]
+    ], operation="Panel -> DB sync")
     grouped = group_keys_by_server(selected_keys)
     servers_by_id = _server_map(servers)
     collection = snapshots or await collect_server_snapshots(
@@ -462,11 +700,11 @@ async def run_db_to_panel_sync(
         if candidate_key_ids is not None
         else None
     )
-    selected_keys = [
+    selected_keys = _managed_keys([
         key
         for key in keys
         if selected_ids is None or int(key.get("id", 0)) in selected_ids
-    ]
+    ], operation="DB -> Panel sync")
     grouped = group_keys_by_server(selected_keys)
     servers_by_id = _server_map(servers)
     collection = snapshots or await collect_server_snapshots(
@@ -496,6 +734,20 @@ async def run_db_to_panel_sync(
             continue
 
         plan.successful_server_ids.append(server_id)
+        bulk_stats_by_email: Dict[str, Dict[str, int]] = {}
+        if apply and snapshot.api_profile == "clients_api":
+            try:
+                bulk_stats_by_email = await _apply_clients_api_bulk_prelude(
+                    server,
+                    server_keys,
+                    snapshot,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Clients API bulk prelude failed for server %s: %s",
+                    server_id,
+                    exc,
+                )
         for key in server_keys:
             report.checked += 1
             try:
@@ -508,6 +760,13 @@ async def run_db_to_panel_sync(
                 report.stats["errors"] += 1
                 logger.warning("Key %s materialization failed: %s", key.get("id"), exc)
                 continue
+            prelude_stats = bulk_stats_by_email.get(
+                str(key.get("panel_email") or "").strip().lower(),
+                {},
+            )
+            for name, value in prelude_stats.items():
+                if name in stats:
+                    stats[name] += int(value or 0)
             for name, value in stats.items():
                 if name in report.stats:
                     report.stats[name] += int(value or 0)

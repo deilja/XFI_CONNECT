@@ -18,6 +18,7 @@ from bot.utils.action_dispatcher import (
 from bot.utils.user_pages import render_access_blocked_page
 from bot.utils.user_ui_texts import render_ui_text
 from bot.services.panel_sync_coordinator import regular_panel_operation
+from bot.utils.panel_email import is_managed_panel_email
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +213,10 @@ async def _execute_key_delete(request: CoreActionRequest) -> None:
     if key['is_active']:
         await _render_key_action_page(target, 'key_operation_unavailable', key=key)
         return
-    if key.get('server_id') and key.get('panel_email'):
+    if (
+        key.get('server_id')
+        and is_managed_panel_email(key.get('panel_email'))
+    ):
         try:
             client = await get_client(key['server_id'])
             if key.get('sub_id'):
@@ -227,6 +231,13 @@ async def _execute_key_delete(request: CoreActionRequest) -> None:
                 logger.info(f"Клиент {key.get('panel_email', 'unknown')} удален с сервера 3X-UI")
         except Exception as e:
             logger.warning(f"Не удалось удалить клиента {key.get('panel_email', 'unknown')} с сервера 3X-UI: {e}")
+    elif key.get('server_id'):
+        logger.warning(
+            "User key deletion skipped panel mutation for key %s with "
+            "unmanaged panel_email=%r",
+            key.get('id'),
+            key.get('panel_email'),
+        )
     success = delete_vpn_key(key_id)
     if success:
         await _render_key_action_page(target, 'my_keys_key_deleted', key=key)
@@ -451,7 +462,7 @@ async def key_replace_server_handler(callback: CallbackQuery, state: FSMContext)
     from database.requests import get_server_by_id, get_key_details_for_user
     from bot.services.vpn_api import (
         get_client,
-        get_client_subscription_inbounds,
+        get_client_inbound_descriptors,
         VPNAPIError,
         is_subscription_mode,
     )
@@ -477,8 +488,11 @@ async def key_replace_server_handler(callback: CallbackQuery, state: FSMContext)
         # Minimum server test (we will receive inbounds later during execution)
         try:
             client = await get_client(server_id)
-            inbounds = await get_client_subscription_inbounds(client)
-            if not inbounds:
+            descriptors = await get_client_inbound_descriptors(
+                client,
+                subscription_mode=True,
+            )
+            if not descriptors:
                 await _render_key_action_page(callback, 'key_operation_unavailable', key=key)
                 return
         except VPNAPIError as e:
@@ -504,7 +518,11 @@ async def key_replace_server_handler(callback: CallbackQuery, state: FSMContext)
 
     try:
         client = await get_client(server_id)
-        inbounds = await client.get_inbounds()
+        descriptors = await get_client_inbound_descriptors(
+            client,
+            subscription_mode=False,
+        )
+        inbounds = [descriptor.as_inbound() for descriptor in descriptors]
         if not inbounds:
             await _render_key_action_page(callback, 'key_operation_unavailable')
             return
@@ -571,8 +589,9 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
     from bot.services.vpn_api import (
         calculate_panel_total_for_key,
         get_client,
-        get_client_subscription_inbounds,
+        get_key_expiry_time_ms,
         get_key_traffic_snapshot,
+        provision_client_on_server,
         VPNAPIError,
         is_subscription_mode,
     )
@@ -607,17 +626,23 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
         traffic_limit = current_key.get('traffic_limit', 0) or 0
         traffic_used = current_key.get('traffic_used', 0) or 0
         old_client = None
+        old_panel_email_managed = is_managed_panel_email(
+            current_key.get('panel_email')
+        )
 
         # === 1. Recording current traffic from the old client ===
-        if current_key.get('server_id') and current_key.get('server_active') and current_key.get('panel_email'):
+        if (
+            current_key.get('server_id')
+            and current_key.get('server_active')
+            and old_panel_email_managed
+        ):
             old_client = await get_client(current_key['server_id'])
             if traffic_limit > 0:
                 try:
-                    if old_had_sub:
-                        old_inbounds = await get_client_subscription_inbounds(old_client)
-                    else:
-                        old_inbounds = await old_client.get_inbounds()
-                    snapshot = await get_key_traffic_snapshot(old_client, current_key, old_inbounds)
+                    snapshot = await get_key_traffic_snapshot(
+                        old_client,
+                        current_key,
+                    )
                     if not snapshot:
                         raise VPNAPIError('панель не вернула счётчики трафика старого ключа')
                     traffic_used = snapshot['traffic_used']
@@ -631,6 +656,13 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
                     raise VPNAPIError(
                         f'Не удалось обновить трафик старого ключа перед заменой: {e}'
                     )
+        elif current_key.get('server_id') and current_key.get('server_active'):
+            logger.warning(
+                "Key replacement skipped old panel client for key %s with "
+                "unmanaged panel_email=%r",
+                key_id,
+                current_key.get('panel_email'),
+            )
 
         if traffic_limit > 0 and traffic_used >= traffic_limit:
             await _render_key_action_page(
@@ -641,7 +673,11 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
             return
 
         # === 2. Delete old ===
-        if current_key.get('server_id') and current_key.get('server_active') and current_key.get('panel_email'):
+        if (
+            current_key.get('server_id')
+            and current_key.get('server_active')
+            and old_panel_email_managed
+        ):
             try:
                 if old_client is None:
                     old_client = await get_client(current_key['server_id'])
@@ -665,7 +701,6 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
                         raise VPNAPIError(f'Не удалось удалить старый ключ: {error_msg}. Замена отменена во избежание дублей.')
 
         # === 3. Counting balances ===
-        new_client = await get_client(new_server_id)
         user_fake_dict = {'telegram_id': telegram_id, 'username': current_key.get('username')}
         new_email = generate_unique_email(user_fake_dict)
         if traffic_limit > 0:
@@ -683,6 +718,7 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
             days_left += 1
         if days_left < 1:
             days_left = 1
+        exact_expiry_time_ms = get_key_expiry_time_ms(current_key)
 
         limit_ip = 1
         if current_key.get('tariff_id'):
@@ -693,46 +729,48 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
 
         # === 4. Creating a new one ===
         if subscription_mode:
-            inbounds = await get_client_subscription_inbounds(new_client)
-            if not inbounds:
-                raise RuntimeError('На сервере нет доступных inbound')
             new_sub_id = _uuid.uuid4().hex
-            first_inbound_id = None
-            first_uuid = None
-            created = 0
-            for inb in inbounds:
-                try:
-                    flow = await new_client.get_inbound_flow(inb['id'])
-                    res = await new_client.add_client(
-                        inbound_id=inb['id'], email=new_email,
-                        total_gb=limit_gb, expire_days=days_left,
-                        limit_ip=limit_ip, enable=True, tg_id=str(telegram_id),
-                        flow=flow, sub_id=new_sub_id,
-                    )
-                    if first_inbound_id is None or inb['id'] < first_inbound_id:
-                        first_inbound_id = inb['id']
-                        first_uuid = res['uuid']
-                    created += 1
-                except Exception as e:
-                    logger.warning(
-                        f"replace_execute (subscription): не удалось создать клиента "
-                        f"в inbound {inb['id']}: {e}"
-                    )
+            provisioned = await provision_client_on_server(
+                server_id=new_server_id,
+                email=new_email,
+                total_gb=limit_gb,
+                total_gb_bytes=remaining_bytes,
+                expire_days=days_left,
+                expiry_time_ms=exact_expiry_time_ms,
+                limit_ip=limit_ip,
+                enable=True,
+                tg_id=str(telegram_id),
+                sub_id=new_sub_id,
+                subscription_mode=True,
+            )
+            first_inbound_id = provisioned.primary_inbound_id
+            first_uuid = provisioned.credential
+            created = len(provisioned.attached_inbound_ids)
             if not first_uuid or first_inbound_id is None or created == 0:
                 raise RuntimeError('Не удалось создать ни одного клиента на новом сервере')
+            new_sub_id = provisioned.sub_id or new_sub_id
             update_vpn_key_connection(
                 key_id=key_id, server_id=new_server_id,
                 panel_inbound_id=first_inbound_id, panel_email=new_email,
                 client_uuid=first_uuid, sub_id=new_sub_id,
             )
         else:
-            flow = await new_client.get_inbound_flow(new_inbound_id)
-            res = await new_client.add_client(
-                inbound_id=new_inbound_id, email=new_email,
-                total_gb=limit_gb, expire_days=days_left,
-                limit_ip=limit_ip, enable=True, tg_id=str(telegram_id), flow=flow,
+            provisioned = await provision_client_on_server(
+                server_id=new_server_id,
+                email=new_email,
+                total_gb=limit_gb,
+                total_gb_bytes=remaining_bytes,
+                expire_days=days_left,
+                expiry_time_ms=exact_expiry_time_ms,
+                limit_ip=limit_ip,
+                enable=True,
+                tg_id=str(telegram_id),
+                subscription_mode=False,
+                inbound_ids=[new_inbound_id],
             )
-            new_uuid = res['uuid']
+            if provisioned.primary_inbound_id is None or not provisioned.credential:
+                raise RuntimeError('Не удалось создать клиента на выбранном inbound')
+            new_uuid = provisioned.credential
             # Clear sub_id (now this is the keys-mode key)
             update_vpn_key_connection(
                 key_id=key_id, server_id=new_server_id,
@@ -747,9 +785,14 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
                 f'полный тариф {traffic_limit / 1024 ** 3:.1f} ГБ, '
                 f'использовано {traffic_used / 1024 ** 3:.1f} ГБ'
             )
-        if subscription_mode:
+        if subscription_mode and not provisioned.complete:
             from bot.services.vpn_api import sync_key_to_panel_state
-            sync_stats = await sync_key_to_panel_state(key_id)
+            sync_kwargs = (
+                {'panel_snapshot': provisioned.snapshot}
+                if provisioned.snapshot is not None
+                else {}
+            )
+            sync_stats = await sync_key_to_panel_state(key_id, **sync_kwargs)
             if not sync_stats.get('ok'):
                 logger.warning(f"replace_execute: subscription-ключ {key_id} синхронизирован не полностью: {sync_stats}")
 

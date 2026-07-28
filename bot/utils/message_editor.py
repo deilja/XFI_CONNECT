@@ -104,6 +104,8 @@ PAGE_KEYS = (
     'key_delivery_failed',
     'key_renewed',
     'expiry_notification_actions',
+    'expired_keys_deleted',
+    'lapsed_key_coupon',
 )
 
 # Stock pages used outside the normal full-screen editor still have to exist at

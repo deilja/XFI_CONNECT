@@ -3,12 +3,27 @@ import logging
 import secrets
 import string
 import datetime
+import json
+from collections.abc import Iterable
 from typing import Optional, List, Dict, Any, Tuple
 from .connection import get_db
 
 logger = logging.getLogger(__name__)
 
+BROADCAST_FILTER_KEYS = (
+    'active',
+    'inactive',
+    'never_paid',
+    'expired',
+    'used_trial',
+)
+_BROADCAST_FILTER_KEY_SET = frozenset(BROADCAST_FILTER_KEYS)
+
 __all__ = [
+    'BROADCAST_FILTER_KEYS',
+    'BroadcastFilterError',
+    'encode_broadcast_filters',
+    'normalize_broadcast_filters',
     'get_users_for_broadcast',
     'count_users_for_broadcast',
     'get_expiring_keys',
@@ -17,89 +32,189 @@ __all__ = [
     'get_keys_stats',
 ]
 
-def get_users_for_broadcast(filter_type: str) -> List[int]:
+
+class BroadcastFilterError(ValueError):
+    """Raised when a stored or supplied broadcast filter selection is invalid."""
+
+
+def normalize_broadcast_filters(
+    value: object,
+    *,
+    allow_legacy: bool = True,
+) -> tuple[str, ...]:
     """
-    Gets a list of telegram_id users for mailing.
-    
+    Return a unique broadcast filter tuple in canonical UI order.
+
+    An empty iterable is the only canonical representation of "all eligible
+    users". Legacy scalar values remain readable during upgrades.
+    """
+    if value is None:
+        raise BroadcastFilterError('Broadcast filter selection is missing')
+    if isinstance(value, str):
+        raw = value.strip()
+        if allow_legacy and raw == 'all':
+            raw_items = []
+        elif allow_legacy and raw in _BROADCAST_FILTER_KEY_SET:
+            raw_items = [raw]
+        else:
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise BroadcastFilterError(
+                    'Invalid broadcast filter selection'
+                ) from error
+            if not isinstance(parsed, list):
+                raise BroadcastFilterError(
+                    'Broadcast filter selection must be a JSON array'
+                )
+            raw_items = parsed
+    elif isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray, dict)):
+        raw_items = list(value)
+    else:
+        raise BroadcastFilterError('Invalid broadcast filter selection')
+
+    selected: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, str) or item not in _BROADCAST_FILTER_KEY_SET:
+            raise BroadcastFilterError(f'Unknown broadcast filter: {item!r}')
+        selected.add(item)
+    return tuple(key for key in BROADCAST_FILTER_KEYS if key in selected)
+
+
+def encode_broadcast_filters(value: object) -> str:
+    """Serialize a valid filter selection as a compact canonical JSON array."""
+    return json.dumps(
+        list(normalize_broadcast_filters(value)),
+        ensure_ascii=False,
+        separators=(',', ':'),
+    )
+
+
+def _broadcast_recipient_query_parts(
+    filters: object,
+) -> tuple[list[str], tuple[object, ...]]:
+    selected = normalize_broadcast_filters(filters)
+    conditions = [
+        'u.is_banned = 0',
+        'u.is_bot_blocked = 0',
+    ]
+
+    if 'active' in selected:
+        conditions.append(
+            """
+            EXISTS (
+                SELECT 1 FROM vpn_keys active_key
+                WHERE active_key.user_id = u.id
+                  AND active_key.expires_at > datetime('now')
+            )
+            """
+        )
+    if 'inactive' in selected:
+        conditions.append(
+            """
+            NOT EXISTS (
+                SELECT 1 FROM vpn_keys active_key
+                WHERE active_key.user_id = u.id
+                  AND active_key.expires_at > datetime('now')
+            )
+            """
+        )
+    if 'never_paid' in selected:
+        conditions.append(
+            """
+            NOT EXISTS (
+                SELECT 1 FROM payments paid_order
+                WHERE paid_order.user_id = u.id
+                  AND paid_order.status = 'paid'
+                  AND COALESCE(
+                        NULLIF(paid_order.purpose, ''),
+                        'legacy_key_payment'
+                      ) IN (
+                        'legacy_key_payment',
+                        'key_purchase',
+                        'key_renewal'
+                      )
+                  AND COALESCE(paid_order.payment_type, '') NOT IN (
+                        'trial',
+                        'promo_free',
+                        'demo'
+                      )
+                  AND COALESCE(paid_order.is_promo_free, 0) = 0
+            )
+            """
+        )
+    if 'expired' in selected:
+        conditions.extend(
+            (
+                """
+                EXISTS (
+                    SELECT 1 FROM vpn_keys expired_key
+                    WHERE expired_key.user_id = u.id
+                      AND expired_key.expires_at <= datetime('now')
+                )
+                """,
+                """
+                NOT EXISTS (
+                    SELECT 1 FROM vpn_keys active_key
+                    WHERE active_key.user_id = u.id
+                      AND active_key.expires_at > datetime('now')
+                )
+                """,
+            )
+        )
+    if 'used_trial' in selected:
+        conditions.append('COALESCE(u.used_trial, 0) = 1')
+
+    return conditions, ()
+
+
+def get_users_for_broadcast(filters: object = ()) -> List[int]:
+    """
+    Gets telegram ids matching all selected broadcast filters.
+
     Args:
-        filter_type: Filter type:
-            - 'all': all non-banned users
-            - 'active': with active (not expired) keys
-            - 'inactive': no active keys
-            - 'never_paid': never purchased a VPN
-            - 'expired': there was a key, but it expired
-    
+        filters: Filter keys. An empty selection means all eligible users.
+            Legacy values ``all`` and one scalar key remain supported.
+
     Returns:
         List of telegram_id users
     """
+    try:
+        conditions, params = _broadcast_recipient_query_parts(filters)
+    except BroadcastFilterError as error:
+        logger.error('Broadcast recipient selection rejected: %s', error)
+        return []
+
     with get_db() as conn:
-        if filter_type == 'all':
-            # All not banned
-            cursor = conn.execute("""
-                SELECT telegram_id FROM users
-                WHERE is_banned = 0 AND is_bot_blocked = 0
-            """)
-        elif filter_type == 'active':
-            # There is at least one unexpired key
-            cursor = conn.execute("""
-                SELECT DISTINCT u.telegram_id 
-                FROM users u
-                JOIN vpn_keys vk ON u.id = vk.user_id
-                WHERE u.is_banned = 0
-                AND u.is_bot_blocked = 0
-                AND vk.expires_at > datetime('now')
-            """)
-        elif filter_type == 'inactive':
-            # No active keys (either all expired or never existed)
-            cursor = conn.execute("""
-                SELECT u.telegram_id 
-                FROM users u
-                WHERE u.is_banned = 0
-                AND u.is_bot_blocked = 0
-                AND u.id NOT IN (
-                    SELECT DISTINCT user_id FROM vpn_keys 
-                    WHERE expires_at > datetime('now')
-                )
-            """)
-        elif filter_type == 'never_paid':
-            # Never bought a VPN (no keys at all)
-            cursor = conn.execute("""
-                SELECT u.telegram_id 
-                FROM users u
-                WHERE u.is_banned = 0
-                AND u.is_bot_blocked = 0
-                AND u.id NOT IN (SELECT DISTINCT user_id FROM vpn_keys)
-            """)
-        elif filter_type == 'expired':
-            # There was a key, but it has already expired (and there are no active ones)
-            cursor = conn.execute("""
-                SELECT DISTINCT u.telegram_id 
-                FROM users u
-                JOIN vpn_keys vk ON u.id = vk.user_id
-                WHERE u.is_banned = 0
-                AND u.is_bot_blocked = 0
-                AND vk.expires_at <= datetime('now')
-                AND u.id NOT IN (
-                    SELECT DISTINCT user_id FROM vpn_keys 
-                    WHERE expires_at > datetime('now')
-                )
-            """)
-        else:
-            return []
-        
+        cursor = conn.execute(
+            'SELECT u.telegram_id FROM users u WHERE ' + ' AND '.join(conditions),
+            params,
+        )
         return [row['telegram_id'] for row in cursor.fetchall()]
 
-def count_users_for_broadcast(filter_type: str) -> int:
+
+def count_users_for_broadcast(filters: object = ()) -> int:
     """
-    Counts the number of users for the newsletter.
-    
+    Counts users matching all selected broadcast filters.
+
     Args:
-        filter_type: Filter type (see get_users_for_broadcast)
-    
+        filters: Filter keys accepted by :func:`get_users_for_broadcast`.
+
     Returns:
         Number of users
     """
-    return len(get_users_for_broadcast(filter_type))
+    try:
+        conditions, params = _broadcast_recipient_query_parts(filters)
+    except BroadcastFilterError as error:
+        logger.error('Broadcast recipient selection rejected: %s', error)
+        return 0
+
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT COUNT(*) AS cnt FROM users u WHERE ' + ' AND '.join(conditions),
+            params,
+        ).fetchone()
+        return int(row['cnt'] if row else 0)
 
 def get_expiring_keys(days: int) -> List[Dict[str, Any]]:
     """

@@ -15,7 +15,8 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from database.requests import (
     get_setting, set_setting,
     get_users_for_broadcast, count_users_for_broadcast,
-    mark_user_bot_blocked, set_broadcast_filter_with_revision,
+    mark_user_bot_blocked, set_broadcast_filters_with_revision,
+    BroadcastFilterError, normalize_broadcast_filters,
 )
 from bot.states.admin_states import AdminStates
 from bot.utils.admin import is_admin
@@ -47,6 +48,7 @@ from bot.services.broadcast_content import (
     send_poll_to_recipient,
     validate_poll_message,
 )
+from bot.services.broadcast_audience import broadcast_filter_status
 from bot.services.broadcast_editor import (
     BroadcastEditorError,
     broadcast_material_hash,
@@ -95,6 +97,14 @@ def render_broadcast_message_text(text: str, telegram_id: int | None) -> str:
     """Renders the mailing text in the event context of a specific recipient."""
     context = build_user_event_context(telegram_id)
     return render_event_placeholders(text, 'broadcast', context, mode='html')
+
+
+def get_broadcast_filters() -> tuple[str, ...]:
+    """Load and validate the canonical working audience selection."""
+    return normalize_broadcast_filters(
+        get_setting('broadcast_filter'),
+        allow_legacy=False,
+    )
 
 
 def is_broadcast_in_progress() -> bool:
@@ -178,7 +188,7 @@ def get_broadcast_menu_text(in_progress: bool = False) -> str:
         "📢 <b>Рассылка</b>\n\n"
         "Отправьте сообщение или опрос пользователям бота.\n\n"
         "1️⃣ Подготовьте материал\n"
-        "2️⃣ Выберите фильтр получателей\n"
+        "2️⃣ При необходимости выберите условия получателей\n"
         "3️⃣ Нажмите «Начать рассылку»"
     )
 
@@ -190,15 +200,29 @@ def get_broadcast_menu_text(in_progress: bool = False) -> str:
 
 async def render_broadcast_menu(
     message: Message,
-    current_filter: str | None = None,
+    current_filters: object | None = None,
     force_new: bool = False,
 ) -> None:
     """Shows the current mailing main screen."""
     msg_data = get_broadcast_message()
     has_message = is_broadcast_content_ready(msg_data)
-    current_filter = current_filter or get_setting('broadcast_filter', 'all')
+    filter_error = False
+    try:
+        selected_filters = (
+            get_broadcast_filters()
+            if current_filters is None
+            else normalize_broadcast_filters(current_filters)
+        )
+    except BroadcastFilterError:
+        logger.exception("Stored broadcast filter selection is invalid")
+        selected_filters = ()
+        filter_error = True
     in_progress = is_broadcast_in_progress()
-    user_count = count_users_for_broadcast(current_filter)
+    user_count = (
+        0
+        if filter_error
+        else count_users_for_broadcast(selected_filters)
+    )
     if not msg_data:
         material_label = "не задан"
     elif msg_data.get("kind") == BROADCAST_KIND_POLL:
@@ -208,11 +232,16 @@ async def render_broadcast_menu(
     else:
         material_label = "текстовое сообщение"
     style_summary = style_profile_summary(load_broadcast_style_profile())
+    filter_status = (
+        "Фильтры (И): ошибка настройки — рассылка заблокирована"
+        if filter_error
+        else broadcast_filter_status(selected_filters)
+    )
     menu_text = (
         get_broadcast_menu_text(in_progress)
         + "\n\n<b>Текущие настройки</b>\n"
         + f"• Материал: {escape_html(material_label)}\n"
-        + f"• Фильтр: {escape_html(BROADCAST_FILTERS.get(current_filter, current_filter))}\n"
+        + f"• {escape_html(filter_status)}\n"
         + f"• Получателей: {user_count}\n"
         + f"• Стиль: {escape_html(style_summary)}\n\n"
         + "💡 Напишите <code>/yaa ваша задача</code>, чтобы открыть редактора рассылки."
@@ -223,7 +252,7 @@ async def render_broadcast_menu(
         menu_text,
         reply_markup=broadcast_main_kb(
             has_message,
-            current_filter,
+            selected_filters,
             in_progress,
             user_count,
             content_kind=msg_data.get('kind') if msg_data else None,
@@ -502,21 +531,51 @@ async def broadcast_preview(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("broadcast_filter:"))
 async def broadcast_set_filter(callback: CallbackQuery):
-    """Sets the recipient filter."""
+    """Toggles one recipient condition in the canonical filter set."""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     
-    filter_key = callback.data.split(":")[1]
+    filter_key = callback.data.split(":", 1)[1]
     
     if filter_key not in BROADCAST_FILTERS:
         await callback.answer("❌ Неизвестный фильтр", show_alert=True)
         return
-    
-    set_broadcast_filter_with_revision(filter_key)
-    
-    await render_broadcast_menu(callback.message, current_filter=filter_key)
-    await callback.answer(f"Фильтр: {BROADCAST_FILTERS[filter_key]}")
+
+    try:
+        selected = set(get_broadcast_filters())
+    except BroadcastFilterError:
+        # An explicit administrator click safely replaces damaged stored state.
+        selected = set()
+    enabled = filter_key not in selected
+    if enabled:
+        selected.add(filter_key)
+    else:
+        selected.remove(filter_key)
+    canonical = normalize_broadcast_filters(selected)
+    set_broadcast_filters_with_revision(canonical)
+
+    await render_broadcast_menu(callback.message, current_filters=canonical)
+    await callback.answer(
+        (
+            "Условие добавлено: "
+            if enabled
+            else "Условие снято: "
+        )
+        + BROADCAST_FILTERS[filter_key]
+    )
+
+
+@router.callback_query(F.data == "broadcast_empty_audience")
+async def broadcast_empty_audience(callback: CallbackQuery):
+    """Explains why a zero-recipient broadcast cannot start."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await callback.answer(
+        "По выбранным условиям нет получателей. Рассылка не запущена.",
+        show_alert=True,
+    )
 
 
 # ============================================================================
@@ -541,11 +600,21 @@ async def broadcast_start(callback: CallbackQuery):
         await callback.answer("❌ Сначала подготовьте сообщение или опрос!", show_alert=True)
         return
     
-    current_filter = get_setting('broadcast_filter', 'all')
-    user_count = count_users_for_broadcast(current_filter)
+    try:
+        current_filters = get_broadcast_filters()
+    except BroadcastFilterError:
+        await callback.answer(
+            "❌ Настройка фильтров повреждена. Выберите условия заново.",
+            show_alert=True,
+        )
+        return
+    user_count = count_users_for_broadcast(current_filters)
     
     if user_count == 0:
-        await callback.answer("❌ Нет пользователей для рассылки!", show_alert=True)
+        await callback.answer(
+            "❌ По выбранным условиям нет получателей. Рассылка не запущена.",
+            show_alert=True,
+        )
         return
     
     try:
@@ -554,7 +623,9 @@ async def broadcast_start(callback: CallbackQuery):
         await callback.answer(str(error), show_alert=True)
         return
 
-    filter_name = BROADCAST_FILTERS.get(current_filter, 'Все')
+    confirmed_filters = normalize_broadcast_filters(confirmation["filters"])
+    filter_status = broadcast_filter_status(confirmed_filters)
+    user_count = int(confirmation["recipient_count"])
     
     content_lines = []
     if msg_data.get('kind') == BROADCAST_KIND_POLL:
@@ -583,7 +654,7 @@ async def broadcast_start(callback: CallbackQuery):
         "🚀 <b>Подтверждение рассылки</b>\n\n"
         + "\n".join(content_lines)
         + "\n\n"
-        + f"<b>Фильтр:</b> {filter_name}\n"
+        + f"<b>{escape_html(filter_status)}</b>\n"
         f"<b>Получателей:</b> {user_count} чел.\n\n"
         "Начать рассылку?"
     )
@@ -654,14 +725,14 @@ async def broadcast_confirm(callback: CallbackQuery, bot: Bot):
         except BroadcastEditorError:
             await render_broadcast_menu(callback.message)
             await callback.answer(
-                "Материал, фильтр или число получателей изменились. Проверьте рассылку заново.",
+                "Материал, фильтры или число получателей изменились. Проверьте рассылку заново.",
                 show_alert=True,
             )
             return
         await safe_edit_or_send(
             callback.message,
             "⚠️ <b>Подтверждение устарело</b>\n\n"
-            "Материал, фильтр или число получателей изменились. "
+            "Материал, фильтры или число получателей изменились. "
             "Проверьте актуальные данные и подтвердите ещё раз.",
             reply_markup=broadcast_confirm_kb(
                 int(fresh["recipient_count"]),
@@ -676,15 +747,23 @@ async def broadcast_confirm(callback: CallbackQuery, bot: Bot):
         await callback.answer("❌ Сообщение не задано!", show_alert=True)
         return
     
-    current_filter = get_setting('broadcast_filter', 'all')
-    user_ids = get_users_for_broadcast(current_filter)
+    try:
+        current_filters = get_broadcast_filters()
+    except BroadcastFilterError:
+        await render_broadcast_menu(callback.message)
+        await callback.answer(
+            "Настройка фильтров повреждена. Выберите условия заново.",
+            show_alert=True,
+        )
+        return
+    user_ids = get_users_for_broadcast(current_filters)
 
     try:
         current_revision = int(get_setting('broadcast_config_revision', '0') or 0)
     except (TypeError, ValueError):
         current_revision = 0
     confirmation_is_current = (
-        str(confirmation.get("filter") or "") == str(current_filter)
+        list(confirmation.get("filters") or []) == list(current_filters)
         and int(confirmation.get("recipient_count") or 0) == len(user_ids)
         and int(confirmation.get("config_revision") or 0) == current_revision
         and str(confirmation.get("material_hash") or "") == broadcast_material_hash(msg_data)
@@ -695,14 +774,14 @@ async def broadcast_confirm(callback: CallbackQuery, bot: Bot):
         except BroadcastEditorError:
             await render_broadcast_menu(callback.message)
             await callback.answer(
-                "Материал, фильтр или число получателей изменились. Проверьте рассылку заново.",
+                "Материал, фильтры или число получателей изменились. Проверьте рассылку заново.",
                 show_alert=True,
             )
             return
         await safe_edit_or_send(
             callback.message,
             "⚠️ <b>Подтверждение устарело</b>\n\n"
-            "Материал, фильтр или число получателей изменились. "
+            "Материал, фильтры или число получателей изменились. "
             "Проверьте актуальные данные и подтвердите ещё раз.",
             reply_markup=broadcast_confirm_kb(
                 int(fresh["recipient_count"]),

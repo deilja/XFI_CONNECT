@@ -19,6 +19,7 @@ from database.db_extensions import *
 from database.db_extension_core import *
 from database.db_business_operations import *
 from database.db_key_lifecycle import *
+from database.db_key_cleanup import *
 from database.db_payment_providers import *
 from database.db_payment_auto_checks import *
 from database.db_payment_intents import *
@@ -28,4 +29,5 @@ from database.db_backup import *
 from database.db_customization_reset import *
 from database.db_support import *
 from database.db_promotions import *
+from database.db_lapsed_coupons import *
 from database.db_user_ui_texts import *

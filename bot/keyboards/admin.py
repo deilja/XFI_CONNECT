@@ -105,5 +105,7 @@ __all__ = [
     'promocodes_list_kb',
     'promocode_detail_kb',
     'coupons_menu_kb',
+    'coupon_purchase_settings_kb',
+    'coupon_lapsed_settings_kb',
     'promotion_cancel_kb',
 ]

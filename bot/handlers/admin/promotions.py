@@ -1,5 +1,4 @@
 import datetime
-import html
 import logging
 
 from aiogram import F, Router
@@ -7,7 +6,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from bot.keyboards.admin import (
-    coupons_menu_kb,
     promocode_detail_kb,
     promocodes_list_kb,
     promotion_cancel_kb,
@@ -17,18 +15,11 @@ from bot.utils.admin import is_admin
 from bot.utils.telegram_links import build_telegram_link, get_telegram_link_domain
 from bot.utils.text import escape_html, get_message_text_for_storage, safe_edit_or_send
 from database.requests import (
-    create_coupon_batch,
     create_promo_code,
-    get_coupon_auto_discount_percent,
-    get_coupon_auto_enabled,
-    get_coupon_auto_lifetime_days,
     get_promo_code_by_code,
     get_promo_code_by_id,
     get_promo_codes,
     is_base62_code,
-    set_coupon_auto_discount_percent,
-    set_coupon_auto_enabled,
-    set_coupon_auto_lifetime_days,
     set_promo_code_active,
     update_promo_code,
 )
@@ -180,7 +171,6 @@ async def promocode_add_limit(message: Message, state: FSMContext):
     bot_info = await message.bot.get_me()
     await safe_edit_or_send(message, _promocode_text(promo, bot_info.username), reply_markup=promocode_detail_kb(promo), force_new=True)
 
-
 @router.callback_query(F.data.startswith("admin_promocode_view:"))
 async def admin_promocode_view(callback: CallbackQuery, state: FSMContext):
     promo_id = int(callback.data.split(":")[1])
@@ -247,127 +237,3 @@ async def admin_promocode_edit_value(message: Message, state: FSMContext):
     promo = get_promo_code_by_id(promo_id)
     bot_info = await message.bot.get_me()
     await safe_edit_or_send(message, _promocode_text(promo, bot_info.username), reply_markup=promocode_detail_kb(promo), force_new=True)
-
-
-@router.callback_query(F.data == "admin_coupons")
-async def admin_coupons(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
-    await state.set_state(AdminStates.admin_menu)
-    text = (
-        "🎫 <b>Купоны</b>\n\n"
-        "Купон — это одноразовый промокод. Его можно ввести в том же поле оплаты, что и обычный промокод. Купон можно подарить, разыграть в канале или передать другому человеку.\n\n"
-        "Авто выдача при покупке помогает удерживать клиента: после каждой платной покупки бот выдаёт купон на следующую покупку. У купона фиксируются скидка и срок жизни на момент генерации, поэтому старые купоны не меняются при новых настройках."
-    )
-    await safe_edit_or_send(
-        callback.message,
-        text,
-        reply_markup=coupons_menu_kb(
-            get_coupon_auto_enabled(),
-            get_coupon_auto_discount_percent(),
-            get_coupon_auto_lifetime_days(),
-        ),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin_coupons_toggle_auto")
-async def admin_coupons_toggle_auto(callback: CallbackQuery, state: FSMContext):
-    set_coupon_auto_enabled(not get_coupon_auto_enabled())
-    await admin_coupons(callback, state)
-
-
-@router.callback_query(F.data == "admin_coupons_edit_discount")
-@router.callback_query(F.data == "admin_coupons_edit_lifetime")
-async def admin_coupon_setting_start(callback: CallbackQuery, state: FSMContext):
-    field = "discount" if callback.data.endswith("discount") else "lifetime"
-    await state.update_data(coupon_setting_field=field)
-    await state.set_state(AdminStates.coupon_setting_value)
-    prompt = "Введите скидку от 0 до 100%." if field == "discount" else "Введите время жизни купона в днях."
-    await safe_edit_or_send(callback.message, f"🎫 <b>Настройка купонов</b>\n\n{prompt}", reply_markup=promotion_cancel_kb("admin_coupons"))
-    await callback.answer()
-
-
-@router.message(AdminStates.coupon_setting_value, F.text, ~F.text.startswith("/"))
-async def admin_coupon_setting_save(message: Message, state: FSMContext):
-    await _delete_input(message)
-    data = await state.get_data()
-    raw = get_message_text_for_storage(message, "plain").strip()
-    try:
-        if data.get("coupon_setting_field") == "discount":
-            if not raw.isdigit() or not 0 <= int(raw) <= 100:
-                raise ValueError()
-            set_coupon_auto_discount_percent(int(raw))
-        else:
-            if not raw.isdigit() or int(raw) <= 0:
-                raise ValueError()
-            set_coupon_auto_lifetime_days(int(raw))
-    except ValueError:
-        await safe_edit_or_send(message, "❌ Значение не принято. Введите корректное число.", reply_markup=promotion_cancel_kb("admin_coupons"), force_new=True)
-        return
-    await state.clear()
-    await safe_edit_or_send(
-        message,
-        "✅ <b>Настройка сохранена</b>",
-        reply_markup=coupons_menu_kb(get_coupon_auto_enabled(), get_coupon_auto_discount_percent(), get_coupon_auto_lifetime_days()),
-        force_new=True,
-    )
-
-
-@router.callback_query(F.data == "admin_coupons_generate")
-async def admin_coupons_generate(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.coupon_generate_discount)
-    await safe_edit_or_send(callback.message, "🎲 <b>Генератор купонов</b>\n\nВведите размер скидки от 0 до 100%.", reply_markup=promotion_cancel_kb("admin_coupons"))
-    await callback.answer()
-
-
-@router.message(AdminStates.coupon_generate_discount, F.text, ~F.text.startswith("/"))
-async def admin_coupons_generate_discount(message: Message, state: FSMContext):
-    await _delete_input(message)
-    raw = get_message_text_for_storage(message, "plain").strip()
-    if not raw.isdigit() or not 0 <= int(raw) <= 100:
-        await safe_edit_or_send(message, "❌ Введите число от 0 до 100.", reply_markup=promotion_cancel_kb("admin_coupons"), force_new=True)
-        return
-    await state.update_data(coupon_generate_discount=int(raw))
-    await state.set_state(AdminStates.coupon_generate_lifetime)
-    await safe_edit_or_send(message, "⏳ <b>Срок жизни</b>\n\nВведите количество дней.", reply_markup=promotion_cancel_kb("admin_coupons"), force_new=True)
-
-
-@router.message(AdminStates.coupon_generate_lifetime, F.text, ~F.text.startswith("/"))
-async def admin_coupons_generate_lifetime(message: Message, state: FSMContext):
-    await _delete_input(message)
-    raw = get_message_text_for_storage(message, "plain").strip()
-    if not raw.isdigit() or int(raw) <= 0:
-        await safe_edit_or_send(message, "❌ Введите количество дней больше 0.", reply_markup=promotion_cancel_kb("admin_coupons"), force_new=True)
-        return
-    await state.update_data(coupon_generate_lifetime=int(raw))
-    await state.set_state(AdminStates.coupon_generate_count)
-    await safe_edit_or_send(message, "🔢 <b>Количество</b>\n\nВведите количество купонов. За один раз можно создать до 500.", reply_markup=promotion_cancel_kb("admin_coupons"), force_new=True)
-
-
-@router.message(AdminStates.coupon_generate_count, F.text, ~F.text.startswith("/"))
-async def admin_coupons_generate_count(message: Message, state: FSMContext):
-    await _delete_input(message)
-    raw = get_message_text_for_storage(message, "plain").strip()
-    if not raw.isdigit() or not 1 <= int(raw) <= 500:
-        await safe_edit_or_send(message, "❌ Введите число от 1 до 500.", reply_markup=promotion_cancel_kb("admin_coupons"), force_new=True)
-        return
-    data = await state.get_data()
-    coupons = create_coupon_batch(
-        discount_percent=data["coupon_generate_discount"],
-        lifetime_days=data["coupon_generate_lifetime"],
-        count=int(raw),
-        source="admin_generated",
-        created_by_admin_id=message.from_user.id,
-    )
-    await state.clear()
-    codes = "\n".join(coupon["code"] for coupon in coupons)
-    text = (
-        "✅ <b>Купоны сгенерированы</b>\n\n"
-        f"Скидка: <b>{data['coupon_generate_discount']}%</b>\n"
-        f"Срок жизни: <b>{data['coupon_generate_lifetime']} дн.</b>\n"
-        f"Количество: <b>{len(coupons)}</b>\n\n"
-        f"<pre>{html.escape(codes)}</pre>"
-    )
-    await safe_edit_or_send(message, text, reply_markup=promotion_cancel_kb("admin_coupons"), force_new=True)

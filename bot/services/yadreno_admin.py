@@ -269,6 +269,10 @@ _CUSTOMIZATION_REFERRAL_TEXTS = frozenset({
     'referral.level_row',
     'referral.balance_line',
 })
+_CUSTOMIZATION_EXPIRED_KEY_TEXTS = frozenset({
+    'key.deleted_list.item',
+    'key.deleted_list.more',
+})
 
 
 def _dependent_user_ui_text_keys(page_key: str | None) -> frozenset[str] | None:
@@ -284,6 +288,8 @@ def _dependent_user_ui_text_keys(page_key: str | None) -> frozenset[str] | None:
         return _CUSTOMIZATION_KEY_TEXTS
     if page_key == 'referral':
         return _CUSTOMIZATION_REFERRAL_TEXTS
+    if page_key == 'expired_keys_deleted':
+        return _CUSTOMIZATION_EXPIRED_KEY_TEXTS
     if page_key in {
         'main', 'prepayment', 'renew_payment', 'payment_tariff_select',
         'payment_method_select', 'payment_method_select_renewal',

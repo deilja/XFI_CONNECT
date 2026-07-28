@@ -38,6 +38,9 @@ _PAGE_PLACEHOLDER_ALIASES_BY_NAME = {
     'keys_total': ('%ключи_всего%',),
     'keys_active': ('%ключи_активных%',),
     'keys_expired': ('%ключи_истекших%',),
+    'retention_days': (),
+    'deleted_key_count': (),
+    'deleted_keys': (),
     'selected_server': ('%выбранный_сервер%',),
     'key_copy': ('%ключ_для_копирования%',),
     'key_link': ('%ключ_ссылка%',),
@@ -70,6 +73,7 @@ _PAGE_PLACEHOLDER_ALIASES_BY_NAME = {
     'payment_minimum': (),
     'promo_code': (),
     'promo_discount': (),
+    'promo_expires_at': (),
     'support_title': ('%поддержка_заголовок%',),
     'support_instruction': ('%поддержка_инструкция%',),
     'support_status_title': ('%поддержка_статус_заголовок%',),
@@ -355,6 +359,16 @@ def _resolve_registered_placeholder(
         return _format_value(_context_value(context, 'keys_active_count'), mode)
     if name == 'keys_expired':
         return _format_value(_context_value(context, 'keys_expired_count'), mode)
+    if name == 'retention_days':
+        return _format_value(_context_value(context, 'retention_days'), mode)
+    if name == 'deleted_key_count':
+        return _format_value(_context_value(context, 'deleted_key_count'), mode)
+    if name == 'deleted_keys':
+        return _format_value(
+            _context_value(context, 'deleted_keys_html'),
+            mode,
+            html_ready=True,
+        )
     if name == 'selected_server':
         return _format_value(_context_value(context, 'selected_server_name'), mode)
     if name == 'keys_list':
@@ -428,6 +442,8 @@ def _resolve_registered_placeholder(
         return _format_value(_context_value(context, 'promo_code'), mode)
     if name == 'promo_discount':
         return _format_value(_context_value(context, 'promo_discount'), mode)
+    if name == 'promo_expires_at':
+        return _format_value(_context_value(context, 'promo_expires_at'), mode)
     if name == 'support_title':
         value = _context_value(context, 'support_title_html')
         if value is not None:

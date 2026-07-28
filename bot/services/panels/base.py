@@ -2,7 +2,7 @@ import abc
 from abc import abstractmethod
 import json
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, Iterable, List
 
 class VPNAPIError(Exception):
     """Error when working with VPN API."""
@@ -15,6 +15,38 @@ class PanelDatabaseBackup:
     data: bytes
     extension: str
     db_kind: str
+
+
+@dataclass(frozen=True)
+class PanelInboundDescriptor:
+    """Lightweight protocol metadata for one manageable inbound."""
+
+    id: int
+    protocol: str
+    remark: str = ""
+    tag: str = ""
+    port: Optional[int] = None
+    tls_flow_capable: bool = False
+    flow: str = ""
+    ss_method: str = ""
+    ignored: bool = False
+    raw: Dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+
+    def as_inbound(self) -> Dict[str, Any]:
+        """Return a legacy-compatible metadata-only inbound dictionary."""
+        result = dict(self.raw)
+        result.update(
+            {
+                "id": self.id,
+                "protocol": self.protocol,
+                "remark": self.remark,
+                "tag": self.tag,
+                "port": self.port,
+                "tlsFlowCapable": self.tls_flow_capable,
+                "ssMethod": self.ss_method,
+            }
+        )
+        return result
 
 
 @dataclass
@@ -34,6 +66,7 @@ class PanelClientState:
     limit_ip: int = 1
     reset: int = 0
     source: str = "legacy_inbounds"
+    details_complete: bool = True
 
 
 @dataclass
@@ -59,6 +92,25 @@ class PanelServerSnapshot:
         return presence
 
 
+@dataclass
+class PanelProvisionResult:
+    """Canonical result of creating or repairing one logical panel client."""
+
+    email: str
+    sub_id: str
+    primary_inbound_id: Optional[int]
+    credential: str
+    attached_inbound_ids: set[int] = field(default_factory=set)
+    failed_inbound_ids: Dict[int, str] = field(default_factory=dict)
+    complete: bool = False
+    api_profile: str = "legacy_inbounds"
+    snapshot: Optional[PanelServerSnapshot] = None
+
+    @property
+    def created_count(self) -> int:
+        return len(self.attached_inbound_ids)
+
+
 def _panel_int(value: Any, default: int = 0) -> int:
     try:
         return int(float(value))
@@ -76,6 +128,55 @@ def _load_settings(value: Any) -> Dict[str, Any]:
         except (json.JSONDecodeError, TypeError):
             return {}
     return {}
+
+
+def build_inbound_descriptor(inbound: Dict[str, Any]) -> Optional[PanelInboundDescriptor]:
+    """Normalize a full or lightweight inbound into one descriptor."""
+    try:
+        inbound_id = int(inbound.get("id"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    protocol = str(inbound.get("protocol") or "").strip().lower()
+    remark = str(inbound.get("remark") or "")
+    stream = _load_settings(inbound.get("streamSettings", {}))
+    settings = _load_settings(inbound.get("settings", {}))
+    raw_tls_flow_capable = inbound.get("tlsFlowCapable", False)
+    if isinstance(raw_tls_flow_capable, str):
+        tls_flow_capable = raw_tls_flow_capable.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    else:
+        tls_flow_capable = bool(raw_tls_flow_capable)
+    if not tls_flow_capable and protocol == "vless":
+        network = str(stream.get("network") or "tcp").lower()
+        security = str(stream.get("security") or "none").lower()
+        tls_flow_capable = network == "tcp" and security in {"reality", "tls"}
+    flow = "xtls-rprx-vision" if tls_flow_capable and protocol == "vless" else ""
+    ss_method = str(
+        inbound.get("ssMethod")
+        or settings.get("method")
+        or ""
+    )
+    try:
+        port = int(inbound.get("port")) if inbound.get("port") is not None else None
+    except (TypeError, ValueError):
+        port = None
+    return PanelInboundDescriptor(
+        id=inbound_id,
+        protocol=protocol,
+        remark=remark,
+        tag=str(inbound.get("tag") or ""),
+        port=port,
+        tls_flow_capable=tls_flow_capable,
+        flow=flow,
+        ss_method=ss_method,
+        ignored=remark.lstrip().startswith("--!"),
+        raw=dict(inbound),
+    )
 
 
 def build_legacy_panel_snapshot(
@@ -170,6 +271,106 @@ class BaseVPNClient(abc.ABC):
         """Return inbounds that can participate in a shared subscription."""
         return await self.get_inbounds(include_ignored=include_ignored)
 
+    async def get_inbound_descriptors(
+        self,
+        *,
+        subscription_mode: bool = False,
+        include_ignored: bool = False,
+    ) -> List[PanelInboundDescriptor]:
+        """Return normalized inbound metadata with a legacy-compatible fallback."""
+        inbounds = (
+            await self.get_subscription_inbounds(include_ignored=True)
+            if subscription_mode
+            else await self.get_inbounds(include_ignored=True)
+        )
+        descriptors = [
+            descriptor
+            for descriptor in (build_inbound_descriptor(item) for item in inbounds)
+            if descriptor is not None
+        ]
+        if include_ignored:
+            return descriptors
+        return [descriptor for descriptor in descriptors if not descriptor.ignored]
+
+    async def provision_client(
+        self,
+        *,
+        email: str,
+        total_gb: int = 0,
+        total_gb_bytes: Optional[int] = None,
+        expire_days: int = 30,
+        expiry_time_ms: Optional[int] = None,
+        limit_ip: int = 1,
+        enable: bool = True,
+        tg_id: str = "",
+        sub_id: Optional[str] = None,
+        subscription_mode: bool = False,
+        inbound_ids: Optional[Iterable[int]] = None,
+    ) -> PanelProvisionResult:
+        """Create a logical client through the adapter's compatible point API."""
+        descriptors = await self.get_inbound_descriptors(
+            subscription_mode=subscription_mode,
+            include_ignored=False,
+        )
+        requested = {int(value) for value in inbound_ids} if inbound_ids is not None else None
+        if requested is not None:
+            descriptors = [item for item in descriptors if item.id in requested]
+
+        attached: set[int] = set()
+        descriptor_ids = {item.id for item in descriptors}
+        failed: Dict[int, str] = {
+            inbound_id: "Inbound is missing, ignored, or incompatible"
+            for inbound_id in sorted((requested or set()) - descriptor_ids)
+        }
+        results: Dict[int, Dict[str, Any]] = {}
+        for descriptor in descriptors:
+            try:
+                result = await self.add_client(
+                    inbound_id=descriptor.id,
+                    email=email,
+                    total_gb=total_gb,
+                    total_gb_bytes=total_gb_bytes,
+                    expire_days=expire_days,
+                    expiry_time_ms=expiry_time_ms,
+                    limit_ip=limit_ip,
+                    enable=enable,
+                    tg_id=tg_id,
+                    flow=descriptor.flow,
+                    sub_id=sub_id,
+                )
+                attached.add(descriptor.id)
+                results[descriptor.id] = result
+            except Exception as exc:
+                failed[descriptor.id] = str(exc)
+
+        primary_id = min(attached) if attached else None
+        primary = results.get(primary_id, {}) if primary_id is not None else {}
+        canonical_sub_id = str(primary.get("sub_id") or sub_id or "")
+        credential = str(
+            primary.get("uuid")
+            or primary.get("password")
+            or primary.get("auth")
+            or email
+        )
+        return PanelProvisionResult(
+            email=email,
+            sub_id=canonical_sub_id,
+            primary_inbound_id=primary_id,
+            credential=credential,
+            attached_inbound_ids=attached,
+            failed_inbound_ids=failed,
+            complete=(
+                bool(descriptors)
+                and len(attached) == len(descriptors)
+                and not failed
+            ),
+            snapshot=None,
+        )
+
+    async def get_client_links(self, email: str) -> List[str]:
+        """Return ready share links when the panel exposes a client-level API."""
+        return []
+
     async def get_sync_snapshot(
         self,
         subscription_mode: bool = False,
@@ -198,7 +399,20 @@ class BaseVPNClient(abc.ABC):
         pass
 
     @abstractmethod
-    async def add_client(self, inbound_id: int, email: str, total_gb: int=0, expire_days: int=30, limit_ip: int=1, enable: bool=True, tg_id: str='', flow: str='', sub_id: Optional[str]=None) -> Dict[str, Any]:
+    async def add_client(
+        self,
+        inbound_id: int,
+        email: str,
+        total_gb: int = 0,
+        expire_days: int = 30,
+        limit_ip: int = 1,
+        enable: bool = True,
+        tg_id: str = "",
+        flow: str = "",
+        sub_id: Optional[str] = None,
+        total_gb_bytes: Optional[int] = None,
+        expiry_time_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
         pass
 
     @abstractmethod

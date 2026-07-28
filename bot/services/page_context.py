@@ -95,6 +95,8 @@ SUPPORTED_YAA_PAGE_KEYS = frozenset({
     'key_delivery_failed',
     'key_renewed',
     'expiry_notification_actions',
+    'expired_keys_deleted',
+    'lapsed_key_coupon',
 })
 
 

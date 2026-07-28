@@ -1463,6 +1463,7 @@ async def _handle_broadcast_yaa(
         ensure_broadcast_editor_stage,
         stage_local_broadcast_photo,
     )
+    from bot.services.broadcast_audience import BROADCAST_FILTER_LABELS
 
     await asyncio.to_thread(ensure_broadcast_editor_stage, message.from_user.id)
     if message.photo:
@@ -1515,6 +1516,21 @@ async def _handle_broadcast_yaa(
                 "task_html": task_html,
                 "changes": "stage_only",
                 "send_requires_local_confirmation": True,
+                "audience_contract": {
+                    "version": 2,
+                    "available_filters": [
+                        {"key": key, "label": label}
+                        for key, label in BROADCAST_FILTER_LABELS.items()
+                    ],
+                    "logic": "and",
+                    "empty_selection_means": "all_eligible_users",
+                    "write_action": "stage_filter",
+                    "write_argument": "audience_filters",
+                    "write_value": "complete_replacement_array",
+                    "clear_value": [],
+                    "legacy_audience_filter_supported": True,
+                    "zero_recipients_blocks_launch": True,
+                },
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -1593,8 +1609,8 @@ async def handle_yaa_command(message: Message, command: CommandObject, state: FS
             intro = (
                 "✍️ <b>Редактор рассылки</b>\n\n"
                 "Добавьте задачу после команды, например:\n"
-                "<code>/yaa составь извинительное письмо и подготовь отправку "
-                "всем, у кого есть ключи</code>"
+                "<code>/yaa подготовь письмо тем, кто брал пробный период "
+                "и ещё ничего не покупал</code>"
             )
         else:
             intro = (

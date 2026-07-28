@@ -417,7 +417,7 @@ def _order_final_amount(order: Dict[str, Any]) -> int:
 
 
 def maybe_issue_auto_coupon_after_payment(order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Issues a one-time coupon after a paid purchase or renewal."""
+    """Issue a one-time coupon after any successful positive payment."""
     return _issue_auto_coupon_after_payment(order)
 
 

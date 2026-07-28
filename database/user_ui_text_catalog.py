@@ -148,6 +148,20 @@ USER_UI_TEXT_DEFINITIONS: tuple[UserUITextDefinition, ...] = (
         frozenset({"promo_code"}),
     ),
     UserUITextDefinition(
+        "key.deleted_list.item",
+        "• <b>%name%</b>",
+        "html",
+        "One key-name row in the grouped expired-key deletion notification.",
+        frozenset({"name"}),
+    ),
+    UserUITextDefinition(
+        "key.deleted_list.more",
+        "• … и ещё <b>%count%</b>",
+        "html",
+        "Overflow row in the grouped expired-key deletion notification.",
+        frozenset({"count"}),
+    ),
+    UserUITextDefinition(
         "referral.no_levels",
         "Пока нет активных уровней реферальной программы.",
         "html",
@@ -197,8 +211,8 @@ USER_UI_TEXT_CATALOG = {
 if len(USER_UI_TEXT_CATALOG) != len(USER_UI_TEXT_DEFINITIONS):
     raise RuntimeError("Duplicate text_key in USER_UI_TEXT_DEFINITIONS")
 
-if len(USER_UI_TEXT_CATALOG) != 26:
-    raise RuntimeError("The initial core user UI text catalog must contain exactly 26 entries")
+if len(USER_UI_TEXT_CATALOG) != 28:
+    raise RuntimeError("The initial core user UI text catalog must contain exactly 28 entries")
 
 
 __all__ = [

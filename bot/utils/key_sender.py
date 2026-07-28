@@ -464,7 +464,7 @@ async def send_key_with_qr(
 
         # 2. Generate data
         logger.info(f"Generating key for {key_data.get('panel_email')} (protocol: {config.get('protocol', 'vless')})")
-        link = generate_link(config)
+        link = str(config.get('direct_link') or generate_link(config))
         key_fields = build_key_page_context(
             key_data,
             inbound=config.get('remark', 'VPN') or 'VPN',

@@ -13,10 +13,15 @@ from .panels.base import (
     VPNAPIError,
     BaseVPNClient,
     PanelClientState,
+    PanelInboundDescriptor,
+    PanelProvisionResult,
     PanelServerSnapshot,
+    build_inbound_descriptor,
 )
 from .panels.xui import XUIClient
 from bot.utils.inbounds import split_ignored_inbounds
+from bot.utils.panel_email import is_managed_panel_email
+from bot.services.panel_key_state import should_panel_client_exist
 from bot.services.panel_sync_coordinator import (
     panel_sync_coordinator,
     regular_panel_operation,
@@ -75,6 +80,171 @@ async def get_client_subscription_inbounds(
     if include_ignored:
         return await client.get_inbounds(include_ignored=True)
     return await client.get_inbounds()
+
+
+async def get_client_inbound_descriptors(
+    client: BaseVPNClient,
+    *,
+    subscription_mode: bool = False,
+    include_ignored: bool = False,
+) -> List[PanelInboundDescriptor]:
+    """Return lightweight inbound metadata with adapter compatibility."""
+    class_method = getattr(type(client), "get_inbound_descriptors", None)
+    instance_method = getattr(client, "__dict__", {}).get(
+        "get_inbound_descriptors"
+    )
+    method = (
+        getattr(client, "get_inbound_descriptors")
+        if callable(class_method) or callable(instance_method)
+        else None
+    )
+    if method is not None:
+        result = method(
+            subscription_mode=subscription_mode,
+            include_ignored=include_ignored,
+        )
+        return await result if inspect.isawaitable(result) else result
+
+    inbounds = (
+        await get_client_subscription_inbounds(
+            client,
+            include_ignored=include_ignored,
+        )
+        if subscription_mode
+        else await client.get_inbounds(include_ignored=include_ignored)
+    )
+    return [
+        descriptor
+        for descriptor in (
+            build_inbound_descriptor(inbound)
+            for inbound in inbounds
+        )
+        if descriptor is not None
+        and (include_ignored or not descriptor.ignored)
+    ]
+
+
+async def provision_client_on_server(
+    *,
+    server_id: int,
+    email: str,
+    total_gb: int = 0,
+    total_gb_bytes: Optional[int] = None,
+    expire_days: int = 30,
+    expiry_time_ms: Optional[int] = None,
+    limit_ip: int = 1,
+    enable: bool = True,
+    tg_id: str = "",
+    sub_id: Optional[str] = None,
+    subscription_mode: bool = False,
+    inbound_ids: Optional[List[int]] = None,
+    client: Optional[BaseVPNClient] = None,
+) -> PanelProvisionResult:
+    """Provision one logical client through the best supported panel path."""
+    if not is_managed_panel_email(email):
+        raise VPNAPIError(
+            f"Refusing to provision unmanaged panel client: {email!r}"
+        )
+    panel_client = client or await get_client(server_id)
+    class_method = getattr(type(panel_client), "provision_client", None)
+    instance_method = getattr(panel_client, "__dict__", {}).get(
+        "provision_client"
+    )
+    provision = (
+        getattr(panel_client, "provision_client")
+        if callable(class_method) or callable(instance_method)
+        else None
+    )
+    if provision is not None:
+        provision_kwargs = {
+            "email": email,
+            "total_gb": total_gb,
+            "expire_days": expire_days,
+            "limit_ip": limit_ip,
+            "enable": enable,
+            "tg_id": tg_id,
+            "sub_id": sub_id,
+            "subscription_mode": subscription_mode,
+            "inbound_ids": inbound_ids,
+        }
+        if total_gb_bytes is not None:
+            provision_kwargs["total_gb_bytes"] = int(total_gb_bytes)
+        if expiry_time_ms is not None:
+            provision_kwargs["expiry_time_ms"] = int(expiry_time_ms)
+        result = provision(**provision_kwargs)
+        result = await result if inspect.isawaitable(result) else result
+        if isinstance(result, PanelProvisionResult):
+            return result
+        raise VPNAPIError("Panel adapter returned an invalid provisioning result")
+
+    requested = {int(value) for value in inbound_ids} if inbound_ids is not None else None
+    if requested is not None:
+        descriptors = []
+        for inbound_id in sorted(requested):
+            flow_result = panel_client.get_inbound_flow(inbound_id)
+            flow = (
+                await flow_result
+                if inspect.isawaitable(flow_result)
+                else flow_result
+            )
+            descriptors.append(
+                PanelInboundDescriptor(
+                    id=inbound_id,
+                    protocol="",
+                    flow=flow if isinstance(flow, str) else "",
+                )
+            )
+    else:
+        descriptors = await get_client_inbound_descriptors(
+            panel_client,
+            subscription_mode=subscription_mode,
+            include_ignored=False,
+        )
+    if requested is not None:
+        descriptors = [
+            descriptor for descriptor in descriptors if descriptor.id in requested
+        ]
+
+    canonical_sub_id = str(sub_id or "")
+    attached: set[int] = set()
+    failed: Dict[int, str] = {}
+    results: Dict[int, Dict[str, Any]] = {}
+    for descriptor in descriptors:
+        try:
+            result = await panel_client.add_client(
+                inbound_id=descriptor.id,
+                email=email,
+                total_gb=total_gb,
+                expire_days=expire_days,
+                limit_ip=limit_ip,
+                enable=enable,
+                tg_id=tg_id,
+                flow=descriptor.flow,
+                sub_id=canonical_sub_id or None,
+            )
+            canonical_sub_id = str(result.get("sub_id") or canonical_sub_id)
+            attached.add(descriptor.id)
+            results[descriptor.id] = result
+        except Exception as exc:
+            failed[descriptor.id] = str(exc)
+
+    primary_id = min(attached) if attached else None
+    primary = results.get(primary_id, {}) if primary_id is not None else {}
+    return PanelProvisionResult(
+        email=email,
+        sub_id=canonical_sub_id,
+        primary_inbound_id=primary_id,
+        credential=str(primary.get("uuid") or email),
+        attached_inbound_ids=attached,
+        failed_inbound_ids=failed,
+        complete=(
+            bool(descriptors)
+            and len(attached) == len(descriptors)
+            and not failed
+        ),
+        snapshot=None,
+    )
+
 
 def get_client_from_server_data(server: Dict[str, Any]) -> BaseVPNClient:
     """
@@ -218,11 +388,13 @@ async def reset_key_traffic_if_active(key_id: int) -> bool:
     server_data = _build_server_data_from_key(key)
     inbound_id = key.get('panel_inbound_id')
     email = key.get('panel_email')
-    if not email:
-        if key.get('username'):
-            email = f"user_{key['username']}"
-        else:
-            email = f"user_{key['telegram_id']}"
+    if not is_managed_panel_email(email):
+        logger.warning(
+            "Traffic reset skipped key %s with unmanaged panel_email=%r",
+            key_id,
+            key.get('panel_email'),
+        )
+        return False
     try:
         client = get_client_from_server_data(server_data)
         success = await client.reset_client_traffic(inbound_id, email)
@@ -253,8 +425,13 @@ async def extend_key_on_server(key_id: int, days: int) -> bool:
     inbound_id = key.get('panel_inbound_id')
     client_uuid = key.get('client_uuid')
     email = key.get('panel_email')
-    if not email:
-        email = f"user_{key.get('username') or key.get('telegram_id')}"
+    if not is_managed_panel_email(email):
+        logger.warning(
+            "Expiry extension skipped key %s with unmanaged panel_email=%r",
+            key_id,
+            key.get('panel_email'),
+        )
+        return False
     try:
         client = get_client_from_server_data(server_data)
         success = await client.extend_client_expiry(inbound_id, client_uuid, email, days)
@@ -308,7 +485,10 @@ async def restore_key_traffic_limit(key_id: int) -> bool:
     update_key_traffic_limit(key_id, traffic_limit)
     
     # Update totalGB on the panel
-    if key.get('server_active') and key.get('panel_email'):
+    if (
+        key.get('server_active')
+        and is_managed_panel_email(key.get('panel_email'))
+    ):
         try:
             server_data = _build_server_data_from_key(key)
             client = get_client_from_server_data(server_data)
@@ -322,6 +502,13 @@ async def restore_key_traffic_limit(key_id: int) -> bool:
         except Exception as e:
             logger.error(f'Не удалось восстановить лимит ключа {key_id} на панели: {e}')
             return False
+    elif key.get('server_active'):
+        logger.warning(
+            "Traffic-limit restore skipped key %s with unmanaged panel_email=%r",
+            key_id,
+            key.get('panel_email'),
+        )
+        return False
     
     return True
 
@@ -329,7 +516,8 @@ async def restore_key_traffic_limit(key_id: int) -> bool:
 def _client_identifier(client: Dict[str, Any]) -> str:
     """Returns the 3X-UI client ID for update/delete."""
     return (
-        client.get('id')
+        client.get('uuid')
+        or client.get('id')
         or client.get('password')
         or client.get('auth')
         or client.get('email')
@@ -356,6 +544,11 @@ def _key_expiry_time_ms(key: Dict[str, Any]) -> int:
     except (ValueError, TypeError) as e:
         logger.warning(f"_key_expiry_time_ms: не удалось разобрать expires_at={expires_at!r}: {e}")
         return 0
+
+
+def get_key_expiry_time_ms(key: Dict[str, Any]) -> int:
+    """Return the exact 3X-UI expiry timestamp for a database key."""
+    return _key_expiry_time_ms(key)
 
 
 def _key_days_left_for_add(key: Dict[str, Any]) -> int:
@@ -503,6 +696,7 @@ async def _add_client_from_snapshot(
             })
         else:
             total_gb = int(result.get('total_gb', kwargs.get('total_gb', 0)) or 0)
+            total_gb_bytes = kwargs.get('total_gb_bytes')
             placement = {
                 'email': email,
                 'id': identifier,
@@ -512,7 +706,11 @@ async def _add_client_from_snapshot(
                 'limitIp': int(kwargs.get('limit_ip', 1) or 1),
                 'flow': kwargs.get('flow') or '',
                 'expiryTime': int(result.get('expire_time', 0) or 0),
-                'totalGB': total_gb * (1024 ** 3),
+                'totalGB': (
+                    max(0, int(total_gb_bytes))
+                    if total_gb_bytes is not None
+                    else total_gb * (1024 ** 3)
+                ),
                 'reset': 0,
             }
         state.inbound_ids.add(inbound_id)
@@ -566,6 +764,18 @@ async def _update_client_from_snapshot(
 ) -> bool:
     """Point-update a client without a preliminary per-client/inbound read."""
     call_kwargs = dict(kwargs)
+    state = (
+        snapshot.get_client(kwargs.get('email'))
+        if snapshot is not None
+        else None
+    )
+    if (
+        state is not None
+        and isinstance(client, XUIClient)
+        and not state.details_complete
+    ):
+        await client.hydrate_client_state(state)
+        panel_client = state.client
     if snapshot is not None and isinstance(client, XUIClient):
         call_kwargs['panel_client'] = panel_client
     result = bool(await client.update_client_full(**call_kwargs))
@@ -586,7 +796,6 @@ async def _update_client_from_snapshot(
     panel_client.update(updated_fields)
 
     if snapshot is not None:
-        state = snapshot.get_client(kwargs.get('email'))
         if state is not None:
             inbound_id = int(kwargs.get('inbound_id', 0) or 0)
             if _client_uses_clients_api(client):
@@ -831,7 +1040,9 @@ async def get_key_traffic_snapshot(
     if not email:
         return None
 
-    if key.get('sub_id'):
+    if key.get('sub_id') or (
+        _client_uses_clients_api(client) and inbounds is None
+    ):
         try:
             try:
                 stats_result = client.get_client_stats(email, resolve_inbound=False)
@@ -877,6 +1088,8 @@ def _get_inbound_flow_from_data(inbound: Dict[str, Any]) -> Optional[str]:
     protocol = inbound.get('protocol', '')
     if protocol != 'vless':
         return ""
+    if bool(inbound.get("tlsFlowCapable")):
+        return "xtls-rprx-vision"
     if 'streamSettings' not in inbound:
         return None
 
@@ -1015,7 +1228,8 @@ async def _ensure_subscription_keys_on_server_impl(
         subId from the client found on the panel) and saves it in the database.
       - Updates vpn_keys.panel_inbound_id and client_uuid to the minimum inbound.
       - Updates expiryTime, totalGB, enable and subId for all clients with this email.
-      - If traffic_exhausted OR expired - sets enable=False.
+      - Missing inactive clients are not created.
+      - If traffic_exhausted, expired or owner-banned - sets enable=False.
       - If the key is active, set enable=True.
 
     'key' mode:
@@ -1050,7 +1264,6 @@ async def _ensure_subscription_keys_on_server_impl(
     async with lock_context:
         from database.requests import get_vpn_key_by_id
         from database.db_keys import (
-            is_key_active, is_traffic_exhausted,
             update_vpn_key_config, update_vpn_key_sub_id,
         )
 
@@ -1063,6 +1276,16 @@ async def _ensure_subscription_keys_on_server_impl(
         server_id = key.get('server_id')
         if not email or not server_id:
             return stats
+        if not is_managed_panel_email(email):
+            logger.warning(
+                "ensure_subscription_keys skipped key %s with unmanaged panel_email=%r",
+                key_id,
+                email,
+            )
+            stats['skipped'] = 1
+            stats['ok'] = 1
+            return stats
+        active = should_panel_client_exist(key)
 
         server_data = _build_server_data_from_key(key)
         mode = get_bot_mode()
@@ -1128,8 +1351,6 @@ async def _ensure_subscription_keys_on_server_impl(
 
         expiry_time_ms = _key_expiry_time_ms(key)
         traffic_limit = key.get('traffic_limit', 0) or 0
-        user_banned = bool(key.get('is_banned', 0))
-        active = is_key_active(key) and not is_traffic_exhausted(key) and not user_banned
         limit_ip = 1
         if key.get('tariff_id'):
             from database.db_tariffs import get_tariff_by_id
@@ -1228,45 +1449,154 @@ async def _ensure_subscription_keys_on_server_impl(
             visible_inbounds_by_id = {inb.get('id'): inb for inb in inbounds}
 
             # Create in missing inbound
-            missing = [inb for inb in inbounds if inb['id'] not in presence]
-            for inb in missing:
-                try:
-                    flow = await _get_inbound_flow_safe(client, inb['id'], server_id, inb)
-                    if dry_run:
-                        res = {'uuid': key.get('client_uuid') or email}
-                    else:
-                        res = await _add_client_from_snapshot(
-                            client,
-                            panel_snapshot,
-                            inbound_id=inb['id'],
-                            email=email,
-                            total_gb=total_gb,
-                            expire_days=days_left if days_left > 0 else 365,
-                            limit_ip=limit_ip,
-                            enable=active,
-                            tg_id=str(key.get('telegram_id') or ''),
-                            flow=flow,
-                            sub_id=sub_id,
+            missing = (
+                [inb for inb in inbounds if inb['id'] not in presence]
+                if active
+                else []
+            )
+            if missing and uses_clients_api and isinstance(client, XUIClient):
+                missing_ids = {int(inb['id']) for inb in missing}
+                if dry_run:
+                    synthetic = {'uuid': key.get('client_uuid') or email}
+                    for inb in missing:
+                        flow = _get_inbound_flow_from_data(inb) or ''
+                        presence[inb['id']] = presence_after_add(
+                            inb['id'],
+                            synthetic,
+                            flow,
+                            sub_id,
                         )
-                    stats['created'] += 1
-                    presence[inb['id']] = presence_after_add(
-                        inb['id'],
-                        res,
-                        flow,
-                        sub_id,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"ensure_subscription_keys: не удалось создать клиента {email} "
-                        f"в inbound {inb['id']} сервера {server_id}: {e}"
-                    )
-                    stats['errors'] += 1
+                    stats['created'] += len(missing)
+                else:
+                    try:
+                        if presence:
+                            record = await client.attach_client_inbounds(
+                                email,
+                                missing_ids,
+                                known_state=snapshot_client,
+                                verify=False,
+                            )
+                            if not record:
+                                raise VPNAPIError(
+                                    "Panel did not return the attached client"
+                                )
+                            canonical_client, confirmed_ids = (
+                                client._split_clients_api_record(record)
+                            )
+                            confirmed_missing = missing_ids.intersection(
+                                confirmed_ids
+                            )
+                            for inbound_id in confirmed_missing:
+                                presence[inbound_id] = dict(canonical_client)
+                            stats['created'] += len(confirmed_missing)
+                            stats['errors'] += len(
+                                missing_ids - confirmed_missing
+                            )
+                            if panel_snapshot is not None:
+                                state = panel_snapshot.get_client(email)
+                                if state is not None:
+                                    state.client = dict(canonical_client)
+                                    state.inbound_ids = set(confirmed_ids)
+                                    state.placements = {
+                                        inbound_id: dict(canonical_client)
+                                        for inbound_id in confirmed_ids
+                                    }
+                                    # A successful attach does not make a slim
+                                    # paged row complete. Keep the flag so the
+                                    # first replacing update hydrates the full
+                                    # protocol-specific client record.
+                        else:
+                            provisioned = await client.provision_client(
+                                email=email,
+                                total_gb=total_gb,
+                                total_gb_bytes=target_total_bytes,
+                                expire_days=days_left if days_left > 0 else 365,
+                                expiry_time_ms=expiry_time_ms,
+                                limit_ip=limit_ip,
+                                enable=active,
+                                tg_id=str(key.get('telegram_id') or ''),
+                                sub_id=sub_id,
+                                subscription_mode=True,
+                                inbound_ids=sorted(missing_ids),
+                            )
+                            provision_state = (
+                                provisioned.snapshot.get_client(email)
+                                if provisioned.snapshot is not None
+                                else None
+                            )
+                            for inbound_id in provisioned.attached_inbound_ids:
+                                presence[inbound_id] = (
+                                    dict(provision_state.client)
+                                    if provision_state is not None
+                                    else {
+                                        'email': email,
+                                        'id': provisioned.credential,
+                                        'subId': provisioned.sub_id,
+                                    }
+                                )
+                            stats['created'] += len(
+                                provisioned.attached_inbound_ids
+                            )
+                            stats['errors'] += len(
+                                provisioned.failed_inbound_ids
+                            )
+                            if (
+                                panel_snapshot is not None
+                                and provision_state is not None
+                            ):
+                                panel_snapshot.clients[email.lower()] = (
+                                    provision_state
+                                )
+                    except Exception as e:
+                        logger.warning(
+                            "ensure_subscription_keys: batch provision failed "
+                            "for %s on server %s: %s",
+                            email,
+                            server_id,
+                            e,
+                        )
+                        stats['errors'] += len(missing)
+            else:
+                for inb in missing:
+                    try:
+                        flow = await _get_inbound_flow_safe(client, inb['id'], server_id, inb)
+                        if dry_run:
+                            res = {'uuid': key.get('client_uuid') or email}
+                        else:
+                            res = await _add_client_from_snapshot(
+                                client,
+                                panel_snapshot,
+                                inbound_id=inb['id'],
+                                email=email,
+                                total_gb=total_gb,
+                                total_gb_bytes=target_total_bytes,
+                                expire_days=days_left if days_left > 0 else 365,
+                                expiry_time_ms=expiry_time_ms,
+                                limit_ip=limit_ip,
+                                enable=active,
+                                tg_id=str(key.get('telegram_id') or ''),
+                                flow=flow,
+                                sub_id=sub_id,
+                            )
+                        stats['created'] += 1
+                        presence[inb['id']] = presence_after_add(
+                            inb['id'],
+                            res,
+                            flow,
+                            sub_id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"ensure_subscription_keys: не удалось создать клиента {email} "
+                            f"в inbound {inb['id']} сервера {server_id}: {e}"
+                        )
+                        stats['errors'] += 1
 
             # Update panel_inbound_id/client_uuid to the MINIMUM present inbound
             if presence:
                 min_inb_id = min(presence.keys())
                 min_client = presence[min_inb_id]
-                uuid_or_pwd = min_client.get('id') or min_client.get('password') or ''
+                uuid_or_pwd = _client_identifier(min_client)
                 if (key.get('panel_inbound_id') != min_inb_id
                         or (key.get('client_uuid') or '') != uuid_or_pwd):
                     if not dry_run:
@@ -1450,6 +1780,8 @@ async def _ensure_subscription_keys_on_server_impl(
                 except (KeyError, TypeError, ValueError):
                     continue
             if (
+                active
+                and
                 target_inbound_id in visible_inbound_ids
                 and target_inbound_id not in presence
             ):
@@ -1475,7 +1807,9 @@ async def _ensure_subscription_keys_on_server_impl(
                             inbound_id=target_inbound_id,
                             email=email,
                             total_gb=total_gb,
+                            total_gb_bytes=calculate_panel_total_for_key(key, 0),
                             expire_days=days_left if days_left > 0 else 365,
+                            expiry_time_ms=expiry_time_ms,
                             limit_ip=limit_ip,
                             enable=active,
                             tg_id=str(key.get('telegram_id') or ''),
@@ -1560,7 +1894,12 @@ async def _ensure_subscription_keys_on_server_impl(
                     None,
                 )
                 flow = await _get_inbound_flow_safe(client, min_inb_id, server_id, min_inbound)
-                min_panel_used = 0 if reset_traffic else inbound_usage_by_id.get(min_inb_id, 0)
+                if reset_traffic:
+                    min_panel_used = 0
+                elif uses_clients_api and snapshot_traffic_known:
+                    min_panel_used = aggregate_panel_used
+                else:
+                    min_panel_used = inbound_usage_by_id.get(min_inb_id, 0)
                 target_total_bytes = calculate_panel_total_for_key(key, min_panel_used)
                 enable_changed = (
                     _panel_bool(min_client.get('enable'), True) != active
@@ -1686,6 +2025,7 @@ __all__ = [
     "reset_key_traffic_if_active", "extend_key_on_server", "restore_key_traffic_limit",
     "push_key_to_panel", "restore_traffic_limit_in_db",
     "get_bot_mode", "is_subscription_mode",
+    "get_client_inbound_descriptors", "provision_client_on_server",
     "ensure_subscription_keys_on_server", "sync_key_to_panel_state",
     "get_subscription_url_for_key", "get_key_traffic_snapshot",
 ]

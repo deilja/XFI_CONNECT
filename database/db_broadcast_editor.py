@@ -6,6 +6,7 @@ import json
 from typing import Any, Optional
 
 from .connection import get_db
+from .db_stats import encode_broadcast_filters
 
 __all__ = [
     "apply_broadcast_editor_stage",
@@ -19,6 +20,7 @@ __all__ = [
     "set_broadcast_confirmation_raw",
     "set_broadcast_content_with_revision",
     "set_broadcast_filter_with_revision",
+    "set_broadcast_filters_with_revision",
 ]
 
 BROADCAST_CONTENT_SETTING = "broadcast_message"
@@ -95,6 +97,7 @@ def get_broadcast_editor_snapshot(telegram_id: int) -> dict[str, Optional[str]]:
     return {
         "content": values.get(BROADCAST_CONTENT_SETTING),
         "filter": values.get(BROADCAST_FILTER_SETTING),
+        "filters": values.get(BROADCAST_FILTER_SETTING),
         "style": values.get(BROADCAST_STYLE_SETTING),
         "config_revision": values.get(BROADCAST_CONFIG_REVISION_SETTING),
         "stage": values.get(_stage_key(telegram_id)),
@@ -152,8 +155,16 @@ def set_broadcast_content_with_revision(raw_content: str) -> int:
 
 
 def set_broadcast_filter_with_revision(filter_key: str) -> int:
-    """Persist a manually selected filter and advance the shared config revision."""
-    return _set_working_value_with_revision(BROADCAST_FILTER_SETTING, filter_key)
+    """Persist one legacy filter selection and advance the shared revision."""
+    return set_broadcast_filters_with_revision(filter_key)
+
+
+def set_broadcast_filters_with_revision(filter_keys: object) -> int:
+    """Persist a canonical filter array and advance the shared config revision."""
+    return _set_working_value_with_revision(
+        BROADCAST_FILTER_SETTING,
+        encode_broadcast_filters(filter_keys),
+    )
 
 
 def apply_broadcast_editor_stage(
@@ -162,7 +173,7 @@ def apply_broadcast_editor_stage(
     expected_stage_revision: int,
     expected_config_revision: int,
     raw_content: str,
-    filter_key: str,
+    filter_keys: object,
     raw_style: Optional[str],
     raw_saved_stage: str,
 ) -> dict[str, Any]:
@@ -188,7 +199,11 @@ def apply_broadcast_editor_stage(
 
         next_revision = current_config + 1
         _write_setting(conn, BROADCAST_CONTENT_SETTING, raw_content)
-        _write_setting(conn, BROADCAST_FILTER_SETTING, filter_key)
+        _write_setting(
+            conn,
+            BROADCAST_FILTER_SETTING,
+            encode_broadcast_filters(filter_keys),
+        )
         if raw_style is not None:
             _write_setting(conn, BROADCAST_STYLE_SETTING, raw_style)
         _write_setting(conn, BROADCAST_CONFIG_REVISION_SETTING, str(next_revision))

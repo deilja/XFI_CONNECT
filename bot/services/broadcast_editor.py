@@ -14,6 +14,10 @@ from bot.services.broadcast_content import (
     BROADCAST_KIND_POLL,
     normalize_broadcast_content,
 )
+from bot.services.broadcast_audience import (
+    broadcast_audience_state,
+    broadcast_filter_summary,
+)
 from bot.services.broadcast_validation import (
     BroadcastValidationError,
     validate_broadcast_message,
@@ -21,6 +25,7 @@ from bot.services.broadcast_validation import (
 )
 from database.requests import (
     apply_broadcast_editor_stage,
+    BroadcastFilterError,
     compare_and_swap_broadcast_stage,
     count_users_for_broadcast,
     delete_broadcast_confirmation,
@@ -28,13 +33,14 @@ from database.requests import (
     get_broadcast_confirmation_raw,
     get_broadcast_editor_snapshot,
     insert_broadcast_stage_if_absent,
+    normalize_broadcast_filters,
     pop_broadcast_confirmation_raw,
     set_broadcast_confirmation_raw,
 )
 
 BROADCAST_STAGE_TTL_SECONDS = 24 * 60 * 60
 BROADCAST_CONFIRM_TTL_SECONDS = 10 * 60
-BROADCAST_STAGE_SCHEMA_VERSION = 1
+BROADCAST_STAGE_SCHEMA_VERSION = 2
 
 DEFAULT_BROADCAST_STYLE_PROFILE: dict[str, Any] = {
     "schema_version": 1,
@@ -47,14 +53,6 @@ DEFAULT_BROADCAST_STYLE_PROFILE: dict[str, Any] = {
     "cta": "direct_calm",
     "use_lists": True,
     "custom_instructions": "",
-}
-
-BROADCAST_FILTER_LABELS = {
-    "all": "Все пользователи",
-    "active": "С активными ключами",
-    "inactive": "Без активных ключей",
-    "never_paid": "Никогда не покупали",
-    "expired": "Ключ истёк",
 }
 
 _STYLE_ENUMS = {
@@ -154,11 +152,24 @@ def _parse_content(raw: Optional[str]) -> Optional[dict[str, Any]]:
         return None
 
 
+def _working_filter_keys(
+    snapshot: dict[str, Optional[str]],
+) -> tuple[str, ...]:
+    """Read only the canonical JSON-array form used by working settings."""
+    return normalize_broadcast_filters(
+        snapshot.get("filters"),
+        allow_legacy=False,
+    )
+
+
 def _new_stage(snapshot: dict[str, Optional[str]]) -> dict[str, Any]:
     now = int(time.time())
-    filter_key = str(snapshot.get("filter") or "all")
-    if filter_key not in BROADCAST_FILTER_LABELS:
-        filter_key = "all"
+    try:
+        filter_keys = _working_filter_keys(snapshot)
+    except BroadcastFilterError:
+        # The state payload will expose the damaged working selection and keep
+        # launch/save fail-closed until the administrator explicitly replaces it.
+        filter_keys = ()
     return {
         "schema_version": BROADCAST_STAGE_SCHEMA_VERSION,
         "base_config_revision": _safe_int(snapshot.get("config_revision")),
@@ -166,7 +177,7 @@ def _new_stage(snapshot: dict[str, Optional[str]]) -> dict[str, Any]:
         "created_at": now,
         "updated_at": now,
         "content": _parse_content(snapshot.get("content")),
-        "filter": filter_key,
+        "filters": list(filter_keys),
         "default_style_patch": {},
         "one_off_style_override": {},
         "dirty_fields": [],
@@ -181,12 +192,24 @@ def _parse_stage(raw: Optional[str]) -> Optional[dict[str, Any]]:
         stage = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return None
-    if not isinstance(stage, dict) or stage.get("schema_version") != BROADCAST_STAGE_SCHEMA_VERSION:
+    if not isinstance(stage, dict) or stage.get("schema_version") not in {1, 2}:
         return None
     if not isinstance(stage.get("dirty_fields"), list):
         return None
-    if stage.get("filter") not in BROADCAST_FILTER_LABELS:
+    try:
+        if stage.get("schema_version") == 1:
+            if "filter" not in stage:
+                return None
+            filter_keys = normalize_broadcast_filters(stage["filter"])
+        else:
+            if not isinstance(stage.get("filters"), list):
+                return None
+            filter_keys = normalize_broadcast_filters(stage["filters"])
+    except BroadcastFilterError:
         return None
+    stage["schema_version"] = BROADCAST_STAGE_SCHEMA_VERSION
+    stage["filters"] = list(filter_keys)
+    stage.pop("filter", None)
     stage["content"] = normalize_broadcast_content(stage.get("content"))
     try:
         stage["default_style_patch"] = validate_style_profile(
@@ -281,16 +304,39 @@ def _state_payload(
     status: str = "ok",
     changed_fields: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    filter_key = str(stage.get("filter") or "all")
-    recipient_count = count_users_for_broadcast(filter_key)
+    filter_keys = normalize_broadcast_filters(stage.get("filters") or [])
     current_config_revision = _safe_int(snapshot.get("config_revision"))
     config_conflict = stage.get("base_config_revision") != current_config_revision
+    dirty_fields = list(stage.get("dirty_fields") or [])
+    audience_error = ""
+    try:
+        _working_filter_keys(snapshot)
+    except BroadcastFilterError:
+        if "filter" not in dirty_fields:
+            audience_error = (
+                "Рабочая настройка фильтров повреждена. "
+                "Задайте аудиторию заново."
+            )
+    recipient_count = (
+        0
+        if audience_error
+        else count_users_for_broadcast(filter_keys)
+    )
     validation_error = ""
     try:
         _validate_stage_content(stage.get("content"))
     except (BroadcastEditorError, BroadcastValidationError) as error:
         validation_error = str(error)
     effective_style = _effective_style(stage, snapshot)
+    audience = broadcast_audience_state(filter_keys, recipient_count)
+    if audience_error:
+        audience["launch_blocker"] = audience_error
+    if not filter_keys:
+        legacy_filter_key = "all"
+    elif len(filter_keys) == 1:
+        legacy_filter_key = filter_keys[0]
+    else:
+        legacy_filter_key = "multiple"
     return {
         "status": status,
         "stage_revision": int(stage.get("stage_revision") or 0),
@@ -298,11 +344,13 @@ def _state_payload(
         "config_revision": current_config_revision,
         "config_conflict": config_conflict,
         "changed_fields": changed_fields or [],
-        "dirty_fields": list(stage.get("dirty_fields") or []),
+        "dirty_fields": dirty_fields,
         "material": _material_state(stage.get("content")),
+        "audience": audience,
         "filter": {
-            "key": filter_key,
-            "label": BROADCAST_FILTER_LABELS[filter_key],
+            "key": legacy_filter_key,
+            "keys": list(filter_keys),
+            "label": broadcast_filter_summary(filter_keys),
             "recipient_count": recipient_count,
         },
         "style": {
@@ -313,8 +361,10 @@ def _state_payload(
             "rewrite_required": bool(stage.get("style_rewrite_required")),
         },
         "validation_error": validation_error,
+        "audience_error": audience_error,
         "ready_to_launch": bool(
             not validation_error
+            and not audience_error
             and not config_conflict
             and not stage.get("style_rewrite_required")
             and recipient_count > 0
@@ -456,12 +506,20 @@ def _stage_poll(telegram_id: int, expected: int, args: dict[str, Any]) -> dict[s
 
 
 def _stage_filter(telegram_id: int, expected: int, args: dict[str, Any]) -> dict[str, Any]:
-    filter_key = str(args.get("audience_filter") or "")
-    if filter_key not in BROADCAST_FILTER_LABELS:
-        raise BroadcastEditorError("Неизвестный фильтр получателей")
+    if "audience_filters" in args:
+        raw_filters = args.get("audience_filters")
+        if not isinstance(raw_filters, list):
+            raise BroadcastEditorError("audience_filters должен быть массивом")
+    else:
+        legacy_filter = str(args.get("audience_filter") or "")
+        raw_filters = [] if legacy_filter == "all" else [legacy_filter]
+    try:
+        filter_keys = normalize_broadcast_filters(raw_filters)
+    except BroadcastFilterError as error:
+        raise BroadcastEditorError("Неизвестный фильтр получателей") from error
 
     def mutate(stage: dict[str, Any]) -> list[str]:
-        stage["filter"] = filter_key
+        stage["filters"] = list(filter_keys)
         dirty = set(stage.get("dirty_fields") or [])
         dirty.add("filter")
         stage["dirty_fields"] = sorted(dirty)
@@ -511,6 +569,17 @@ def save_broadcast_editor_stage(telegram_id: int) -> dict[str, Any]:
     dirty_fields = set(stage.get("dirty_fields") or [])
     if not dirty_fields:
         return _state_payload(stage, snapshot, status="saved")
+    try:
+        _working_filter_keys(snapshot)
+    except BroadcastFilterError:
+        if "filter" not in dirty_fields:
+            return {
+                "status": "error",
+                "error": (
+                    "Рабочая настройка фильтров повреждена. "
+                    "Задайте аудиторию заново."
+                ),
+            }
     if stage.get("content") is not None or "material" in dirty_fields:
         try:
             _validate_stage_content(stage.get("content"))
@@ -541,7 +610,7 @@ def save_broadcast_editor_stage(telegram_id: int) -> dict[str, Any]:
         expected_stage_revision=stage["stage_revision"],
         expected_config_revision=stage["base_config_revision"],
         raw_content=_json_dumps(stage["content"]),
-        filter_key=str(stage["filter"]),
+        filter_keys=stage["filters"],
         raw_style=raw_style,
         raw_saved_stage=_json_dumps(saved_stage),
     )
@@ -561,19 +630,31 @@ def create_broadcast_confirmation(telegram_id: int) -> dict[str, Any]:
     snapshot = get_broadcast_editor_snapshot(telegram_id)
     content = _parse_content(snapshot.get("content"))
     _validate_stage_content(content)
-    filter_key = str(snapshot.get("filter") or "all")
-    if filter_key not in BROADCAST_FILTER_LABELS:
-        raise BroadcastEditorError("Неизвестный рабочий фильтр рассылки")
-    recipient_count = count_users_for_broadcast(filter_key)
+    try:
+        filter_keys = _working_filter_keys(snapshot)
+    except BroadcastFilterError as error:
+        raise BroadcastEditorError(
+            "Рабочая настройка фильтров повреждена"
+        ) from error
+    recipient_count = count_users_for_broadcast(filter_keys)
     if recipient_count <= 0:
-        raise BroadcastEditorError("По выбранному фильтру нет получателей")
+        raise BroadcastEditorError(
+            "По выбранным условиям нет получателей. Рассылка не запущена."
+        )
     now = int(time.time())
+    if not filter_keys:
+        legacy_filter = "all"
+    elif len(filter_keys) == 1:
+        legacy_filter = filter_keys[0]
+    else:
+        legacy_filter = "multiple"
     confirmation = {
-        "schema_version": 1,
+        "schema_version": 2,
         "token": secrets.token_urlsafe(18),
         "config_revision": _safe_int(snapshot.get("config_revision")),
         "material_hash": broadcast_material_hash(content or {}),
-        "filter": filter_key,
+        "filters": list(filter_keys),
+        "filter": legacy_filter,
         "recipient_count": recipient_count,
         "created_at": now,
         "expires_at": now + BROADCAST_CONFIRM_TTL_SECONDS,
@@ -592,7 +673,13 @@ def consume_valid_broadcast_confirmation(telegram_id: int, token: str) -> Option
     except (TypeError, json.JSONDecodeError):
         delete_broadcast_confirmation(telegram_id)
         return None
-    if not isinstance(confirmation, dict) or confirmation.get("token") != token:
+    if (
+        not isinstance(confirmation, dict)
+        or confirmation.get("schema_version") != 2
+        or confirmation.get("token") != token
+    ):
+        if isinstance(confirmation, dict) and confirmation.get("token") == token:
+            delete_broadcast_confirmation(telegram_id)
         return None
     if _safe_int(confirmation.get("expires_at")) <= int(time.time()):
         delete_broadcast_confirmation(telegram_id)
@@ -600,13 +687,20 @@ def consume_valid_broadcast_confirmation(telegram_id: int, token: str) -> Option
 
     snapshot = get_broadcast_editor_snapshot(telegram_id)
     content = _parse_content(snapshot.get("content"))
-    filter_key = str(snapshot.get("filter") or "all")
+    try:
+        filter_keys = _working_filter_keys(snapshot)
+    except BroadcastFilterError:
+        delete_broadcast_confirmation(telegram_id)
+        return None
     current = {
         "config_revision": _safe_int(snapshot.get("config_revision")),
         "material_hash": broadcast_material_hash(content or {}),
-        "filter": filter_key,
-        "recipient_count": count_users_for_broadcast(filter_key),
+        "filters": list(filter_keys),
+        "recipient_count": count_users_for_broadcast(filter_keys),
     }
+    if current["recipient_count"] <= 0:
+        delete_broadcast_confirmation(telegram_id)
+        return None
     if any(confirmation.get(key) != value for key, value in current.items()):
         delete_broadcast_confirmation(telegram_id)
         return None

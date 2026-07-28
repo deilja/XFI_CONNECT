@@ -107,7 +107,12 @@ async def _answer_callback_if_needed(target, *args, **kwargs) -> None:
 
 async def _continue_new_key_config(target, state: FSMContext, server: dict, *, force_new: bool = False):
     """Continues key configuration after manual or automatic server selection."""
-    from bot.services.vpn_api import get_client, VPNAPIError, is_subscription_mode
+    from bot.services.vpn_api import (
+        VPNAPIError,
+        get_client,
+        get_client_inbound_descriptors,
+        is_subscription_mode,
+    )
     from bot.states.user_states import NewKeyConfig
     from bot.utils.page_button_items import build_protocol_button_items
     from bot.utils.page_renderer import render_page
@@ -122,7 +127,11 @@ async def _continue_new_key_config(target, state: FSMContext, server: dict, *, f
 
     try:
         client = await get_client(server_id)
-        inbounds = await client.get_inbounds()
+        descriptors = await get_client_inbound_descriptors(
+            client,
+            subscription_mode=False,
+        )
+        inbounds = [descriptor.as_inbound() for descriptor in descriptors]
         if not inbounds:
             await _render_key_flow_page(target, 'key_operation_unavailable', force_new=force_new)
             return
@@ -239,7 +248,7 @@ async def process_new_key_subscription_final(target, state: FSMContext, server_i
         get_key_details_for_user, create_initial_vpn_key,
         get_tariff_by_id, update_vpn_key_config,
     )
-    from bot.services.vpn_api import get_client, get_client_subscription_inbounds
+    from bot.services.vpn_api import provision_client_on_server
     from bot.handlers.admin.users_keys import generate_unique_email
     from bot.utils.key_sender import send_key_with_qr
 
@@ -307,44 +316,35 @@ async def process_new_key_subscription_final(target, state: FSMContext, server_i
         panel_email = generate_unique_email(user_fake_dict)
         sub_id = _uuid.uuid4().hex
 
-        client = await get_client(server_id)
-        inbounds = await get_client_subscription_inbounds(client)
-        if not inbounds:
-            raise RuntimeError('На сервере нет доступных inbound')
-
         days = order.get('period_days') or order.get('duration_days') or 30
         _tariff_data = get_tariff_by_id(order['tariff_id'])
         limit_gb = (_tariff_data.get('traffic_limit_gb', 0) or 0) if _tariff_data else 0
+        provisioned = await provision_client_on_server(
+            server_id=server_id,
+            email=panel_email,
+            total_gb=limit_gb,
+            expire_days=days,
+            limit_ip=_tariff_data.get('max_ips', 1) if _tariff_data else 1,
+            enable=True,
+            tg_id=str(telegram_id),
+            sub_id=sub_id,
+            subscription_mode=True,
+        )
+        first_uuid = provisioned.credential
+        first_inbound_id = provisioned.primary_inbound_id
+        ready_count = len(provisioned.attached_inbound_ids)
+        for failed_inbound_id, error in provisioned.failed_inbound_ids.items():
+            logger.warning(
+                "subscription_final: failed to provision inbound %s "
+                "(key_id=%s): %s",
+                failed_inbound_id,
+                key_id,
+                error,
+            )
 
-        first_uuid = None
-        first_inbound_id = None
-        ready_count = 0
-        for inb in inbounds:
-            try:
-                flow = await client.get_inbound_flow(inb['id'])
-                res = await client.add_client(
-                    inbound_id=inb['id'],
-                    email=panel_email,
-                    total_gb=limit_gb,
-                    expire_days=days,
-                    limit_ip=_tariff_data.get('max_ips', 1) if _tariff_data else 1,
-                    enable=True,
-                    tg_id=str(telegram_id),
-                    flow=flow,
-                    sub_id=sub_id,
-                )
-                if first_uuid is None or inb['id'] < first_inbound_id:
-                    first_uuid = res['uuid']
-                    first_inbound_id = inb['id']
-                ready_count += 1
-            except Exception as e:
-                logger.warning(
-                    f"subscription_final: не удалось создать клиента в inbound {inb['id']} "
-                    f"(key_id={key_id}): {e}. Допустимо — синхронизатор доберёт позже."
-                )
-
-        if ready_count == 0 or first_uuid is None or first_inbound_id is None:
+        if ready_count == 0 or not first_uuid or first_inbound_id is None:
             raise RuntimeError('Не удалось создать ни одного клиента на сервере')
+        sub_id = provisioned.sub_id or sub_id
 
         update_vpn_key_config(
             key_id=key_id,
@@ -355,10 +355,28 @@ async def process_new_key_subscription_final(target, state: FSMContext, server_i
             sub_id=sub_id,
         )
         update_payment_key_id(order_id, key_id)
-        from bot.services.vpn_api import sync_key_to_panel_state
-        sync_stats = await sync_key_to_panel_state(key_id)
-        if not sync_stats.get('ok'):
-            logger.warning(f"subscription_final: ключ {key_id} синхронизирован не полностью: {sync_stats}")
+        if provisioned.complete:
+            sync_stats = {
+                'created': ready_count,
+                'deleted': 0,
+                'enabled': 0,
+                'disabled': 0,
+                'updated': 0,
+                'skipped': ready_count,
+                'reset': 0,
+                'errors': 0,
+                'ok': 1,
+            }
+        else:
+            from bot.services.vpn_api import sync_key_to_panel_state
+            sync_kwargs = (
+                {'panel_snapshot': provisioned.snapshot}
+                if provisioned.snapshot is not None
+                else {}
+            )
+            sync_stats = await sync_key_to_panel_state(key_id, **sync_kwargs)
+            if not sync_stats.get('ok'):
+                logger.warning(f"subscription_final: ключ {key_id} синхронизирован не полностью: {sync_stats}")
         from bot.services.key_lifecycle import emit_key_lifecycle_event_safe
 
         await emit_key_lifecycle_event_safe(
@@ -405,7 +423,7 @@ async def process_new_key_inbound_selection(callback: CallbackQuery, state: FSMC
 async def process_new_key_final(target, state: FSMContext, server_id: int, inbound_id: int):
     """The final stage of key creation."""
     from database.requests import get_server_by_id, update_vpn_key_config, update_payment_key_id, find_order_by_order_id, get_user_internal_id, get_key_details_for_user, create_initial_vpn_key
-    from bot.services.vpn_api import get_client
+    from bot.services.vpn_api import provision_client_on_server
     from bot.handlers.admin.users_keys import generate_unique_email
     from bot.utils.key_sender import send_key_with_qr
     data = await state.get_data()
@@ -469,15 +487,25 @@ async def process_new_key_final(target, state: FSMContext, server_id: int, inbou
         username = owner_username
         user_fake_dict = {'telegram_id': telegram_id, 'username': username}
         panel_email = generate_unique_email(user_fake_dict)
-        client = await get_client(server_id)
         days = order.get('period_days') or order.get('duration_days') or 30
         # Traffic limit from the tariff (0 = unlimited on the panel)
         from database.requests import get_tariff_by_id as _get_tariff_for_limit
         _tariff_data = _get_tariff_for_limit(order['tariff_id'])
         limit_gb = (_tariff_data.get('traffic_limit_gb', 0) or 0) if _tariff_data else 0
-        flow = await client.get_inbound_flow(inbound_id)
-        res = await client.add_client(inbound_id=inbound_id, email=panel_email, total_gb=limit_gb, expire_days=days, limit_ip=_tariff_data.get('max_ips', 1) if _tariff_data else 1, enable=True, tg_id=str(telegram_id), flow=flow)
-        client_uuid = res['uuid']
+        provisioned = await provision_client_on_server(
+            server_id=server_id,
+            email=panel_email,
+            total_gb=limit_gb,
+            expire_days=days,
+            limit_ip=_tariff_data.get('max_ips', 1) if _tariff_data else 1,
+            enable=True,
+            tg_id=str(telegram_id),
+            subscription_mode=False,
+            inbound_ids=[inbound_id],
+        )
+        if provisioned.primary_inbound_id is None or not provisioned.credential:
+            raise RuntimeError('Не удалось создать клиента на выбранном inbound')
+        client_uuid = provisioned.credential
         update_vpn_key_config(key_id=key_id, server_id=server_id, panel_inbound_id=inbound_id, panel_email=panel_email, client_uuid=client_uuid)
         update_payment_key_id(order_id, key_id)
         from bot.services.key_lifecycle import emit_key_lifecycle_event_safe

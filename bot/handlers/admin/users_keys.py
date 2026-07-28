@@ -15,9 +15,10 @@ from bot.states.admin_states import AdminStates
 from bot.keyboards.admin import users_menu_kb, users_list_kb, user_view_kb, user_ban_confirm_kb, key_view_kb, add_key_server_kb, add_key_inbound_kb, add_key_step_kb, add_key_confirm_kb, users_input_cancel_kb, key_action_cancel_kb, back_and_home_kb, home_only_kb
 from bot.services.vpn_api import (
     get_client_from_server_data,
+    get_client_inbound_descriptors,
     VPNAPIError,
     format_traffic,
-    get_client_subscription_inbounds,
+    provision_client_on_server,
 )
 from bot.handlers.admin.users_manage import format_user_display, _show_user_view_edit
 from bot.handlers.admin.users_list import show_users_menu
@@ -292,8 +293,11 @@ async def select_add_key_server(callback: CallbackQuery, state: FSMContext):
     if is_subscription_mode():
         try:
             client = get_client_from_server_data(server)
-            inbounds = await get_client_subscription_inbounds(client)
-            if not inbounds:
+            descriptors = await get_client_inbound_descriptors(
+                client,
+                subscription_mode=True,
+            )
+            if not descriptors:
                 await callback.answer('❌ На сервере нет inbound', show_alert=True)
                 return
         except VPNAPIError as e:
@@ -309,7 +313,11 @@ async def select_add_key_server(callback: CallbackQuery, state: FSMContext):
 
     try:
         client = get_client_from_server_data(server)
-        inbounds = await client.get_inbounds()
+        descriptors = await get_client_inbound_descriptors(
+            client,
+            subscription_mode=False,
+        )
+        inbounds = [descriptor.as_inbound() for descriptor in descriptors]
         if not inbounds:
             await callback.answer('❌ На сервере нет inbound', show_alert=True)
             return
@@ -392,57 +400,60 @@ async def confirm_add_key(callback: CallbackQuery, state: FSMContext, bot: Bot):
     traffic_limit_bytes = (traffic_gb or 0) * 1024 ** 3
     subscription_mode = is_subscription_mode() and inbound_id is None
     try:
-        client = get_client_from_server_data(server)
         admin_tariff = get_admin_tariff()
         tariff_id = admin_tariff['id']
 
         if subscription_mode:
-            inbounds = await get_client_subscription_inbounds(client)
-            if not inbounds:
-                await callback.answer('❌ На сервере нет inbound', show_alert=True)
-                return
             sub_id = _uuid.uuid4().hex
-            first_inbound_id = None
-            first_uuid = None
-            created = 0
-            for inb in inbounds:
-                try:
-                    flow = await client.get_inbound_flow(inb['id'])
-                    res = await client.add_client(
-                        inbound_id=inb['id'], email=email,
-                        total_gb=traffic_gb, expire_days=days,
-                        limit_ip=admin_tariff.get('max_ips', 1), tg_id=str(user_telegram_id),
-                        flow=flow, sub_id=sub_id,
-                    )
-                    if first_inbound_id is None or inb['id'] < first_inbound_id:
-                        first_inbound_id = inb['id']
-                        first_uuid = res['uuid']
-                    created += 1
-                except Exception as e:
-                    logger.warning(
-                        f"admin_add_key (subscription): не удалось создать клиента "
-                        f"в inbound {inb['id']}: {e}"
-                    )
+            provisioned = await provision_client_on_server(
+                server_id=server_id,
+                email=email,
+                total_gb=traffic_gb,
+                expire_days=days,
+                limit_ip=admin_tariff.get('max_ips', 1),
+                tg_id=str(user_telegram_id),
+                sub_id=sub_id,
+                subscription_mode=True,
+            )
+            first_inbound_id = provisioned.primary_inbound_id
+            first_uuid = provisioned.credential
+            created = len(provisioned.attached_inbound_ids)
             if not first_uuid or first_inbound_id is None or created == 0:
                 raise RuntimeError('Не удалось создать ни одного клиента на сервере')
+            sub_id = provisioned.sub_id or sub_id
             key_id = create_vpn_key_subscription_admin(
                 user_id=user_id, server_id=server_id, tariff_id=tariff_id,
                 panel_inbound_id=first_inbound_id, panel_email=email,
                 client_uuid=first_uuid, sub_id=sub_id,
                 days=days, traffic_limit=traffic_limit_bytes,
             )
-            from bot.services.vpn_api import sync_key_to_panel_state
-            sync_stats = await sync_key_to_panel_state(key_id)
-            if not sync_stats.get('ok'):
-                logger.warning(f"admin_add_key: subscription-ключ {key_id} синхронизирован не полностью: {sync_stats}")
+            if not provisioned.complete:
+                from bot.services.vpn_api import sync_key_to_panel_state
+                sync_kwargs = (
+                    {'panel_snapshot': provisioned.snapshot}
+                    if provisioned.snapshot is not None
+                    else {}
+                )
+                sync_stats = await sync_key_to_panel_state(
+                    key_id,
+                    **sync_kwargs,
+                )
+                if not sync_stats.get('ok'):
+                    logger.warning(f"admin_add_key: subscription-ключ {key_id} синхронизирован не полностью: {sync_stats}")
         else:
-            flow = await client.get_inbound_flow(inbound_id)
-            result = await client.add_client(
-                inbound_id=inbound_id, email=email, total_gb=traffic_gb,
-                expire_days=days, limit_ip=admin_tariff.get('max_ips', 1),
-                tg_id=str(user_telegram_id), flow=flow,
+            provisioned = await provision_client_on_server(
+                server_id=server_id,
+                email=email,
+                total_gb=traffic_gb,
+                expire_days=days,
+                limit_ip=admin_tariff.get('max_ips', 1),
+                tg_id=str(user_telegram_id),
+                subscription_mode=False,
+                inbound_ids=[inbound_id],
             )
-            client_uuid = result['uuid']
+            if provisioned.primary_inbound_id is None or not provisioned.credential:
+                raise RuntimeError('Не удалось создать клиента на выбранном inbound')
+            client_uuid = provisioned.credential
             key_id = create_vpn_key_admin(
                 user_id=user_id, server_id=server_id, tariff_id=tariff_id,
                 panel_inbound_id=inbound_id, panel_email=email,

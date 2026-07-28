@@ -69,15 +69,15 @@ def admin_main_menu_kb() -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(
-            text='🤖 Yadreno Admin',
-            callback_data='admin_yadreno',
+            text='🛠 Кастомизация YadrenoVPN',
+            callback_data='admin_yadreno_customization',
             style='primary',
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text='🛠 Кастомизация YadrenoVPN',
-            callback_data='admin_yadreno_customization',
+            text='🤖 Yadreno Admin',
+            callback_data='admin_yadreno',
             style='primary',
         )
     )

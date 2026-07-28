@@ -14,6 +14,11 @@ import json
 import re
 from decimal import Decimal, InvalidOperation
 from .connection import get_db
+from .db_stats import (
+    BroadcastFilterError,
+    encode_broadcast_filters,
+    normalize_broadcast_filters,
+)
 from .db_user_ui_texts import update_user_ui_text_defaults
 from .user_ui_text_catalog import USER_UI_TEXT_DEFINITIONS
 
@@ -38,7 +43,7 @@ def _add_column(conn: sqlite3.Connection, table: str, column_def: str) -> None:
 INITIAL_VERSION = 73
 
 # Current version of the database schema (incremented when new migrations are added)
-LATEST_VERSION = 85
+LATEST_VERSION = 88
 
 DEFAULT_BROADCAST_STYLE_PROFILE = {
     "schema_version": 1,
@@ -117,6 +122,31 @@ def _my_keys_empty_page_buttons() -> str:
         {"id": "btn_buy_key",   "label": "💳 Купить ключ", "color": "secondary", "row": 0, "col": 0, "is_hidden": False, "action_type": "internal", "action_value": "cmd_buy"},
         {"id": "btn_back_main", "label": "🈴 На главную", "color": "secondary", "row": 1, "col": 0, "is_hidden": False, "action_type": "internal", "action_value": "cmd_back_main"},
     ], ensure_ascii=False)
+
+
+def _expired_keys_deleted_page_text() -> str:
+    """Default grouped notification after expired keys are removed from the bot."""
+    return (
+        "🗑️ <b>Неактивные ключи удалены</b>\n\n"
+        "Срок действия этих VPN-ключей закончился не менее "
+        "%retention_days% дней назад, поэтому мы удалили их из бота:\n\n"
+        "%deleted_keys%\n\n"
+        "Если VPN снова понадобится, нажмите «Купить ключ» — "
+        "новый доступ можно оформить в любое время."
+    )
+
+
+def _lapsed_key_coupon_page_text() -> str:
+    """Default win-back coupon page after all user keys have expired."""
+    return (
+        "🎁 <b>Купон для вас</b>\n\n"
+        "Мы заметили, что вы не продлили VPN-ключ, и хотим помочь вам "
+        "вернуться.\n\n"
+        "Ваш купон на скидку <b>%promo_discount%%</b>:\n"
+        "<pre>%promo_code%</pre>\n"
+        "Купон действует до <b>%promo_expires_at%</b>.\n\n"
+        "Введите его в поле промокода при следующей покупке или продлении."
+    )
 
 
 def _renew_payment_page_text() -> str:
@@ -544,7 +574,8 @@ def migration_initial(conn: sqlite3.Connection) -> None:
     """)
 
     default_settings = [
-        ('broadcast_filter', 'all'),
+        ('broadcast_filter', '[]'),
+        ('broadcast_filter_contract_version', '2'),
         ('broadcast_in_progress', '0'),
         (
             'broadcast_style_profile',
@@ -579,6 +610,8 @@ def migration_initial(conn: sqlite3.Connection) -> None:
         ('traffic_notification_text',
          '⚠️ По ключу <b>%ключ_имя%</b> осталось %ключ_трафик_процент_остатка%% трафика (%ключ_трафик_использовано% из %ключ_трафик_лимит%)'),
         ('monthly_traffic_reset_enabled', '0'),
+        ('expired_key_retention_days', '30'),
+        ('expired_key_deletion_notifications_enabled', '1'),
         ('referral_enabled', '0'),
         ('referral_reward_type', 'days'),
         ('referral_new_ref_notifications_enabled', '0'),
@@ -2233,6 +2266,10 @@ def _user_ui_page_defaults_v81() -> dict[str, tuple[str, str]]:
             "",
             _ui_key_buttons(),
         ),
+        "expired_keys_deleted": (
+            _expired_keys_deleted_page_text(),
+            _my_keys_empty_page_buttons(),
+        ),
     }
     return pages
 
@@ -3223,6 +3260,254 @@ def migration_85(conn: sqlite3.Connection) -> None:
     )
 
 
+def migration_86(conn: sqlite3.Connection) -> None:
+    """Migration v86: expired-key retention settings and deletion page."""
+    for key, value in (
+        ('expired_key_retention_days', '30'),
+        ('expired_key_deletion_notifications_enabled', '1'),
+    ):
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+
+    page_key = 'expired_keys_deleted'
+    text_default = _expired_keys_deleted_page_text()
+    buttons_default = _my_keys_empty_page_buttons()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO pages (page_key, text_default, buttons_default)
+        VALUES (?, ?, ?)
+        """,
+        (page_key, text_default, buttons_default),
+    )
+    conn.execute(
+        """
+        UPDATE pages
+        SET text_default = ?, buttons_default = ?
+        WHERE page_key = ?
+        """,
+        (text_default, buttons_default, page_key),
+    )
+
+    update_user_ui_text_defaults(
+        (
+            definition
+            for definition in USER_UI_TEXT_DEFINITIONS
+            if definition.text_key in {
+                'key.deleted_list.item',
+                'key.deleted_list.more',
+            }
+        ),
+        conn=conn,
+    )
+    logger.info(
+        "Migration v86 applied: expired-key retention and deletion page ready"
+    )
+
+
+def migration_87(conn: sqlite3.Connection) -> None:
+    """Migration v87: canonical multi-filter broadcast audience contract."""
+    marker = conn.execute(
+        """
+        SELECT value FROM settings
+        WHERE key = 'broadcast_filter_contract_version'
+        """
+    ).fetchone()
+    if marker and str(marker[0]) == '2':
+        logger.info("Migration v87 already applied: broadcast filter contract is v2")
+        return
+
+    filter_row = conn.execute(
+        "SELECT value FROM settings WHERE key = 'broadcast_filter'"
+    ).fetchone()
+    raw_filter = filter_row[0] if filter_row else None
+    filter_valid = True
+    try:
+        canonical_filter = encode_broadcast_filters(raw_filter)
+    except BroadcastFilterError:
+        filter_valid = False
+        canonical_filter = str(raw_filter or '')
+        logger.error(
+            "Migration v87 preserved an invalid broadcast_filter value; "
+            "broadcast launch will fail closed until it is replaced"
+        )
+
+    revision_row = conn.execute(
+        "SELECT value FROM settings WHERE key = 'broadcast_config_revision'"
+    ).fetchone()
+    try:
+        current_revision = max(0, int(revision_row[0] if revision_row else 0))
+    except (TypeError, ValueError):
+        current_revision = 0
+    next_revision = current_revision + 1
+
+    migrated_stages = 0
+    removed_stages = 0
+    stage_rows = conn.execute(
+        """
+        SELECT key, value FROM settings
+        WHERE key LIKE 'broadcast_editor_stage:%'
+        """
+    ).fetchall()
+    for stage_key, raw_stage in stage_rows:
+        try:
+            stage = json.loads(raw_stage)
+            if not isinstance(stage, dict):
+                raise ValueError("stage must be an object")
+            schema_version = int(stage.get('schema_version') or 0)
+            if schema_version == 1:
+                if 'filter' not in stage:
+                    raise ValueError("legacy stage filter is missing")
+                stage_filters = normalize_broadcast_filters(stage['filter'])
+            elif schema_version == 2:
+                if not isinstance(stage.get('filters'), list):
+                    raise ValueError("stage filters must be an array")
+                stage_filters = normalize_broadcast_filters(stage['filters'])
+            else:
+                raise ValueError("unsupported stage schema")
+
+            stage['schema_version'] = 2
+            stage['filters'] = list(stage_filters)
+            stage.pop('filter', None)
+            try:
+                base_revision = max(0, int(stage.get('base_config_revision') or 0))
+            except (TypeError, ValueError):
+                base_revision = 0
+            if base_revision == current_revision:
+                stage['base_config_revision'] = next_revision
+            conn.execute(
+                "UPDATE settings SET value = ? WHERE key = ?",
+                (
+                    json.dumps(
+                        stage,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(',', ':'),
+                    ),
+                    stage_key,
+                ),
+            )
+            migrated_stages += 1
+        except (
+            BroadcastFilterError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            conn.execute("DELETE FROM settings WHERE key = ?", (stage_key,))
+            removed_stages += 1
+
+    if filter_valid:
+        conn.execute(
+            """
+            INSERT INTO settings (key, value) VALUES ('broadcast_filter', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (canonical_filter,),
+        )
+    conn.execute(
+        """
+        INSERT INTO settings (key, value)
+        VALUES ('broadcast_config_revision', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (str(next_revision),),
+    )
+    conn.execute("DELETE FROM settings WHERE key LIKE 'broadcast_confirm:%'")
+    conn.execute(
+        """
+        INSERT INTO settings (key, value)
+        VALUES ('broadcast_filter_contract_version', '2')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """
+    )
+    logger.info(
+        "Migration v87 applied: multi-filter broadcast audience ready "
+        "(filter_valid=%s, stages_migrated=%s, stages_removed=%s)",
+        filter_valid,
+        migrated_stages,
+        removed_stages,
+    )
+
+
+def migration_88(conn: sqlite3.Connection) -> None:
+    """Migration v88: lapsed-user automatic coupons and editable page."""
+    for key, value in (
+        ('coupon_lapsed_enabled', '0'),
+        ('coupon_lapsed_discount_percent', '10'),
+        ('coupon_lapsed_lifetime_days', '90'),
+        ('coupon_lapsed_delay_days', '7'),
+        ('coupon_lapsed_enabled_since', ''),
+    ):
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lapsed_coupon_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            lapse_token TEXT NOT NULL,
+            lapsed_at TIMESTAMP NOT NULL,
+            coupon_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'sent', 'failed', 'canceled')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            sent_at TIMESTAMP,
+            UNIQUE (user_id, lapse_token),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (coupon_id) REFERENCES promo_codes(id) ON DELETE SET NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lapsed_coupon_deliveries_due
+        ON lapsed_coupon_deliveries(status, lapsed_at, id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lapsed_coupon_deliveries_coupon
+        ON lapsed_coupon_deliveries(coupon_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_codes_lapsed_coupon
+        ON promo_codes(source) WHERE source LIKE 'auto_lapsed:%'
+        """
+    )
+
+    page_key = 'lapsed_key_coupon'
+    text_default = _lapsed_key_coupon_page_text()
+    buttons_default = _ui_key_buttons()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO pages (page_key, text_default, buttons_default)
+        VALUES (?, ?, ?)
+        """,
+        (page_key, text_default, buttons_default),
+    )
+    conn.execute(
+        """
+        UPDATE pages
+        SET text_default = ?, buttons_default = ?
+        WHERE page_key = ?
+        """,
+        (text_default, buttons_default, page_key),
+    )
+    logger.info(
+        "Migration v88 applied: lapsed-user automatic coupons are ready"
+    )
+
+
 MIGRATIONS = {
     74: migration_74,
     75: migration_75,
@@ -3236,6 +3521,9 @@ MIGRATIONS = {
     83: migration_83,
     84: migration_84,
     85: migration_85,
+    86: migration_86,
+    87: migration_87,
+    88: migration_88,
 }
 
 

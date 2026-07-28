@@ -1,7 +1,11 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.keyboards.admin_misc import back_button, home_button
+from bot.keyboards.admin_misc import (
+    back_button,
+    home_button,
+    state_pair_buttons,
+)
 
 
 def promocodes_list_kb(promocodes: list[dict]) -> InlineKeyboardMarkup:
@@ -30,14 +34,98 @@ def promocode_detail_kb(promo: dict) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def coupons_menu_kb(enabled: bool, discount_percent: int, lifetime_days: int) -> InlineKeyboardMarkup:
+def coupons_menu_kb(
+    purchase_enabled: bool,
+    lapsed_enabled: bool,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    toggle_text = "🟢 Авто выдача при покупке" if enabled else "⚪ Авто выдача при покупке"
-    builder.row(InlineKeyboardButton(text=toggle_text, callback_data="admin_coupons_toggle_auto"))
-    builder.row(InlineKeyboardButton(text=f"📊 Размер скидки: {discount_percent}%", callback_data="admin_coupons_edit_discount"))
-    builder.row(InlineKeyboardButton(text=f"⏳ Время жизни: {lifetime_days} дн.", callback_data="admin_coupons_edit_lifetime"))
+    purchase_status = "🟢" if purchase_enabled else "⚪"
+    lapsed_status = "🟢" if lapsed_enabled else "⚪"
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{purchase_status} Автовыдача при покупке",
+            callback_data="admin_coupons_purchase",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{lapsed_status} Автовыдача не продлившим ключ",
+            callback_data="admin_coupons_lapsed",
+        )
+    )
     builder.row(InlineKeyboardButton(text="🎲 Сгенерировать", callback_data="admin_coupons_generate"))
     builder.row(back_button("admin_marketing"), home_button())
+    return builder.as_markup()
+
+
+def coupon_purchase_settings_kb(
+    enabled: bool,
+    discount_percent: int,
+    lifetime_days: int,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(*state_pair_buttons(
+        enabled,
+        "Включено",
+        "admin_coupons_purchase_set:1",
+        "Выключено",
+        "admin_coupons_purchase_set:0",
+    ))
+    builder.row(
+        InlineKeyboardButton(
+            text=f"📊 Размер скидки: {discount_percent}%",
+            callback_data="admin_coupons_setting:purchase:discount",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"⏳ Время жизни: {lifetime_days} дн.",
+            callback_data="admin_coupons_setting:purchase:lifetime",
+        )
+    )
+    builder.row(
+        back_button("admin_coupons"),
+        home_button(),
+    )
+    return builder.as_markup()
+
+
+def coupon_lapsed_settings_kb(
+    enabled: bool,
+    discount_percent: int,
+    lifetime_days: int,
+    delay_days: int,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(*state_pair_buttons(
+        enabled,
+        "Включено",
+        "admin_coupons_lapsed_set:1",
+        "Выключено",
+        "admin_coupons_lapsed_set:0",
+    ))
+    builder.row(
+        InlineKeyboardButton(
+            text=f"📊 Размер скидки: {discount_percent}%",
+            callback_data="admin_coupons_setting:lapsed:discount",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"⏳ Время жизни: {lifetime_days} дн.",
+            callback_data="admin_coupons_setting:lapsed:lifetime",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"📅 Отправлять через: {delay_days} дн.",
+            callback_data="admin_coupons_setting:lapsed:delay",
+        )
+    )
+    builder.row(
+        back_button("admin_coupons"),
+        home_button(),
+    )
     return builder.as_markup()
 
 

@@ -12,11 +12,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from bot.keyboards.admin import (
-    BROADCAST_FILTERS,
     broadcast_confirm_kb,
     broadcast_editor_dirty_exit_kb,
     broadcast_editor_kb,
 )
+from bot.services.broadcast_audience import broadcast_filter_status
 from bot.services.broadcast_content import BROADCAST_KIND_POLL, preview_poll
 from bot.services.broadcast_editor import (
     BroadcastEditorError,
@@ -153,7 +153,7 @@ async def broadcast_editor_save(callback: CallbackQuery) -> None:
     await safe_edit_or_send(
         callback.message,
         "💾 <b>Черновик сохранён</b>\n\n"
-        "Рабочий материал, фильтр и выбранный стиль обновлены. "
+        "Рабочий материал, фильтры и выбранный стиль обновлены. "
         "Диалог с редактором остаётся открытым.",
         reply_markup=broadcast_editor_kb(),
     )
@@ -198,15 +198,12 @@ async def broadcast_editor_launch(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Запуск не подготовлен", show_alert=True)
         return
 
-    filter_name = BROADCAST_FILTERS.get(
-        str(confirmation["filter"]),
-        str(confirmation["filter"]),
-    )
+    filter_status = broadcast_filter_status(confirmation["filters"])
     count = int(confirmation["recipient_count"])
     await safe_edit_or_send(
         callback.message,
         "🚀 <b>Проверьте настоящее превью выше</b>\n\n"
-        f"<b>Фильтр:</b> {escape_html(filter_name)}\n"
+        f"<b>{escape_html(filter_status)}</b>\n"
         f"<b>Получателей:</b> {count}\n\n"
         "Рассылка начнётся только после кнопки ниже.",
         reply_markup=broadcast_confirm_kb(count, str(confirmation["token"])),

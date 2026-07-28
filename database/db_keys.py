@@ -322,7 +322,7 @@ def get_all_active_keys_with_server() -> List[Dict[str, Any]]:
                 vk.traffic_notified_pct, vk.custom_name, vk.client_uuid,
                 vk.panel_inbound_id, vk.tariff_id, vk.expires_at, vk.sub_id,
                 s.id as server_id, s.name as server_name,
-                u.telegram_id
+                u.telegram_id, u.is_banned
             FROM vpn_keys vk
             JOIN servers s ON vk.server_id = s.id
             JOIN users u ON vk.user_id = u.id
@@ -334,7 +334,7 @@ def get_all_active_keys_with_server() -> List[Dict[str, Any]]:
 
 
 def get_all_panel_sync_keys() -> List[Dict[str, Any]]:
-    """Return all managed keys on active servers, including expired keys."""
+    """Return all panel-linked keys on active servers, including expired keys."""
     with get_db() as conn:
         cursor = conn.execute("""
             SELECT

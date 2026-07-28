@@ -16,6 +16,8 @@ __all__ = [
     'set_setting',
     'delete_setting',
     'is_update_notifications_enabled',
+    'get_expired_key_retention_days',
+    'is_expired_key_deletion_notifications_enabled',
     'get_display_timezone',
     'set_display_timezone',
     'normalize_display_timezone',
@@ -63,6 +65,10 @@ __all__ = [
 DEFAULT_DISPLAY_TIMEZONE = 'Europe/Moscow'
 DISPLAY_TIMEZONE_SETTING = 'display_timezone'
 UPDATE_NOTIFICATIONS_ENABLED_SETTING = 'update_notifications_enabled'
+EXPIRED_KEY_RETENTION_DAYS_SETTING = 'expired_key_retention_days'
+EXPIRED_KEY_DELETION_NOTIFICATIONS_SETTING = (
+    'expired_key_deletion_notifications_enabled'
+)
 
 _TIMEZONE_ALIASES = {
     'москва': DEFAULT_DISPLAY_TIMEZONE,
@@ -151,6 +157,30 @@ def delete_setting(key: str) -> bool:
 def is_update_notifications_enabled() -> bool:
     """Returns the state of hidden new version notifications."""
     return get_setting(UPDATE_NOTIFICATIONS_ENABLED_SETTING, '1') == '1'
+
+
+def get_expired_key_retention_days() -> int:
+    """Return the validated hidden retention period for expired VPN keys."""
+    raw = get_setting(EXPIRED_KEY_RETENTION_DAYS_SETTING, '30')
+    try:
+        days = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{EXPIRED_KEY_RETENTION_DAYS_SETTING} must be a positive integer"
+        ) from exc
+    if days <= 0:
+        raise ValueError(
+            f"{EXPIRED_KEY_RETENTION_DAYS_SETTING} must be a positive integer"
+        )
+    return days
+
+
+def is_expired_key_deletion_notifications_enabled() -> bool:
+    """Return whether users receive the expired-key deletion page."""
+    return (
+        get_setting(EXPIRED_KEY_DELETION_NOTIFICATIONS_SETTING, '1')
+        == '1'
+    )
 
 
 def normalize_display_timezone(value: Optional[str]) -> str:
