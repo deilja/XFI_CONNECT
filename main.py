@@ -19,6 +19,9 @@ from database.migrations import run_migrations
 from bot.services.vpn_api import close_all_clients
 from bot.services.scheduler import run_daily_tasks, run_update_check_scheduler, run_traffic_sync_scheduler
 from bot.services.payment_auto_check import run_payment_auto_check_scheduler
+# Built-in Crypto Pay provider and admin-menu compatibility hook.
+from bot.services import cryptobot_provider as _cryptobot_provider  # noqa: F401
+from bot.services import cryptobot_ui as _cryptobot_ui  # noqa: F401
 
 # Importing routers
 from bot.handlers.user import router as user_router
@@ -48,9 +51,6 @@ logging.basicConfig(
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
-
-
-
 
 
 async def on_startup(bot: Bot):
@@ -208,14 +208,10 @@ async def main():
     
     # Remove old updates and run polling
     await bot.delete_webhook(drop_pending_updates=True)
-    
 
-    
-    # Launch the daily task scheduler (statistics + backups)
+    # Launch background schedulers.
     daily_tasks = asyncio.create_task(run_daily_tasks(bot))
-    # Launch the update check scheduler
     update_tasks = asyncio.create_task(run_update_check_scheduler(bot))
-    # Launch the traffic synchronization scheduler (every 5 minutes)
     traffic_tasks = asyncio.create_task(run_traffic_sync_scheduler(bot))
     payment_check_tasks = asyncio.create_task(run_payment_auto_check_scheduler(bot))
     background_tasks = [daily_tasks, update_tasks, traffic_tasks, payment_check_tasks]
@@ -231,7 +227,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Let's launch the bot
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
