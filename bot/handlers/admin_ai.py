@@ -79,6 +79,17 @@ def extract_code_block(text: str) -> str:
         return match.group(1).strip()
 
     return text.strip()
+
+
+def _safe_project_path(path: Path) -> bool:
+    """Ensure a pending edit still points inside the project tree."""
+    try:
+        resolved = path.resolve()
+        return resolved == BASE_DIR or BASE_DIR in resolved.parents
+    except (OSError, RuntimeError):
+        return False
+
+
 @router.message(Command("dev"))
 async def cmd_dev(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -139,7 +150,7 @@ async def cmd_dev_edit(message: types.Message):
 
     target_path = (BASE_DIR / rel_path).resolve()
 
-    if not str(target_path).startswith(str(BASE_DIR)):
+    if not _safe_project_path(target_path):
         await message.reply(
             "⛔ Запрещён выход за пределы проекта."
         )
@@ -237,8 +248,17 @@ async def cmd_dev_edit(message: types.Message):
         f"{preview}",
         reply_markup=keyboard,
     )
+
+
 @router.callback_query(F.data.startswith("cancel_code:"))
 async def cb_cancel_code(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
+        return
+
     task_id = callback.data.split(":", 1)[1]
 
     PENDING_TASKS.pop(task_id, None)
@@ -252,6 +272,13 @@ async def cb_cancel_code(callback: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("apply_code:"))
 async def cb_apply_code(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
+        return
+
     task_id = callback.data.split(":", 1)[1]
 
     task = PENDING_TASKS.pop(task_id, None)
@@ -263,9 +290,17 @@ async def cb_apply_code(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    target_path = task["path"]
+    target_path = Path(task["path"])
     rel_path = task["rel_path"]
     new_code = task["new_code"]
+
+    if not _safe_project_path(target_path):
+        logger.error("Rejected unsafe pending edit path: %s", target_path)
+        await callback.message.edit_text(
+            "⛔ Путь задачи больше не находится внутри проекта."
+        )
+        await callback.answer()
+        return
 
     backup_path = target_path.with_suffix(
         target_path.suffix + ".bak"
@@ -378,4 +413,3 @@ async def cb_restart_service(
         )
 
     await callback.answer()
-
