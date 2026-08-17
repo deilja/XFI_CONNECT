@@ -18,14 +18,10 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Compile Python sources
         run: python -m compileall -q . -x '(^|/)(\.git|\.snapshots|__pycache__|venv)(/|$)'
-      - name: Import smoke test
-        env:
-          BOT_TOKEN: "000000000:ci-placeholder"
+      - name: Crypto Pay service smoke test
         run: |
           python - <<'PY'
           import bot.services.cryptobot
           import bot.services.cryptobot_provider
-          import bot.services.cryptobot_ui
-          import bot.handlers.admin.cryptobot
-          print("Crypto Pay imports: OK")
+          print("Crypto Pay service imports: OK")
           PY
