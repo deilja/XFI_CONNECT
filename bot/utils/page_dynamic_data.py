@@ -243,7 +243,9 @@ async def build_my_keys_render_data(telegram_id: int):
         raise RuntimeError(f"Missing required setting: {MY_KEYS_ITEM_TEMPLATE_SETTING}")
     items = []
 
-    for key in keys:
+    for index, key in enumerate(keys, start=1):
+        key = dict(key)
+        key["_list_index"] = index
         traffic_exhausted = is_traffic_exhausted(key)
         if traffic_exhausted:
             status_text = render_ui_text('key.status.traffic_exhausted')

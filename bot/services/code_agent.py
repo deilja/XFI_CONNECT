@@ -1,0 +1,623 @@
+"""
+CodeAgent — диалоговый агент правки кода (только Groq).
+Снапшоты, rollback, отчёт по сессии.
+"""
+from __future__ import annotations
+
+import ast
+import asyncio
+import json
+import logging
+import os
+import shutil
+import subprocess
+import uuid
+from typing import Any
+
+from openai import AsyncOpenAI
+
+import config
+from bot.services.yaadmin_phase2 import PHASE2_TOOLS, execute_phase2_tool
+from bot.services.yaadmin_phase3 import PHASE3_TOOLS, execute_phase3_tool
+from bot.services.yaadmin_phase4 import PHASE4_TOOLS, execute_phase4_tool
+from bot.services.yaadmin_phase5 import PHASE5_TOOLS, execute_phase5_tool
+from bot.services.yaadmin_tools import YAADMIN_TOOLS, execute_yaadmin_tool
+
+logger = logging.getLogger(__name__)
+
+BASE_DIR = os.path.abspath("/root/XFI_CONNECT")
+SNAPSHOT_DIR = os.path.join(BASE_DIR, ".snapshots")
+
+FORBIDDEN_PREFIXES = (
+    "venv/",
+    ".git/",
+    ".snapshots/",
+    "__pycache__/",
+    "vpn_bot.db",
+    ".env",
+)
+
+SYSTEM_PROMPT = """Ты Senior Python-разработчик и техлид этого проекта: Telegram-бот VPN (aiogram 3), 3X-UI, SQLite, Local YaAdmin.
+
+Как общаться:
+- Админ пишет ОБЫЧНЫМ текстом, любыми словами, без команд и без JSON.
+- Пойми цель по смыслу. Не проси писать имена tools или «вызови list_files».
+- Отвечай по-русски коротко и по делу, как опытный разработчик коллеге.
+
+Цикл работы:
+1) Если запрос ясный — действуй (сначала чтение кода/данных, потом вывод).
+2) Если запрос расплывчатый или опасный — ЗАДАЙ 1–3 уточняющих вопроса и НЕ меняй файлы/панель, пока не будет ответа.
+3) Изучай код через list_files / read_file / search_code / run_ruff, не выдумывай содержимое файлов.
+4) Предлагай план правок. write_file / опасные ops — только когда явно просят исправить/применить/сделай, или когда без этого нельзя выполнить уже согласованную задачу.
+5) После правок .py — проверка (ruff/синтаксис), при рестарте бота — смотри результат; при падении — rollback.
+
+Уточняй, если не ясно:
+- какой файл/функция/симптом («не работает» — что именно: оплата, ключ, панель, админка);
+- нужно только объяснить или уже менять код;
+- на проде или можно рискнуть рестартом;
+- для панели: только диагностика или ещё enable/create.
+
+Запреты:
+- не трогать venv, .env, vpn_bot.db, .git;
+- не удалять inbound/ключи массово без явной просьбы;
+- не делать full panel sync apply молча;
+- не переписывать полпроекта ради мелочи.
+
+Инструменты (используй сам, пользователь их не называет):
+код: list_files, read_file, write_file, search_code, run_ruff, restart_and_test_bot;
+ops/панель: yaadmin tools и phase2–5 по необходимости.
+
+Стиль senior: гипотеза → проверка по коду/логам → вывод → (если нужно) план → (если просили) правка → результат.
+"""
+
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_ruff",
+            "description": "Прогнать Ruff по bot/ или файлу. fix=true только по просьбе исправить стиль.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {"type": "string"},
+                    "fix": {"type": "boolean"}
+                }
+            }
+        }
+    },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "Список файлов в каталоге проекта",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_dir": {"type": "string", "description": "Относительный путь, по умолчанию ."}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Прочитать файл проекта",
+            "parameters": {
+                "type": "object",
+                "properties": {"rel_path": {"type": "string"}},
+                "required": ["rel_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Записать файл целиком (со снапшотом и проверкой синтаксиса .py)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["rel_path", "content"],
+            },
+        },
+    },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "list_pages",
+            "description": "Список всех page_key страниц бота (для кастомизации UI)",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_page",
+            "description": "Получить данные страницы бота: текст, кнопки, media",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page_key": {"type": "string", "description": "Ключ страницы, например main, help, my_keys"}
+                },
+                "required": ["page_key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_page_text",
+            "description": "Изменить CUSTOM-текст страницы бота (кастомизация UI)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page_key": {"type": "string"},
+                    "new_text": {"type": "string", "description": "Новый HTML-текст страницы"},
+                },
+                "required": ["page_key", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "restart_and_test_bot",
+            "description": "Перезапустить бота и проверить логи. При падении — авто-rollback",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+
+class CodeAgent:
+    def __init__(self):
+        api_key = getattr(config, "GROQ_API_KEY", "") or ""
+        self.client = (
+            AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+            if api_key
+            else None
+        )
+        self.session_id = str(uuid.uuid4())[:8]
+        self.messages: list[dict] = []
+        self.changed_files: list[str] = []
+        self.pending_plan: str | None = None
+        self.memory_facts: list[str] = []
+        self.page_snapshots: dict[str, str | None] = {}  # page_key -> old text (first change only)
+
+    def reset_dialog(self) -> None:
+        """Очищает историю чата, сессию снапшотов не трогает."""
+        self.messages = []
+        self.pending_plan = None
+        self.memory_facts = []
+
+    def new_session(self) -> None:
+        """Новая сессия снапшотов + чистый диалог."""
+        self.session_id = str(uuid.uuid4())[:8]
+        self.messages = []
+        self.changed_files = []
+        self.page_snapshots = {}
+
+    def report(self) -> str:
+        if not self.changed_files:
+            return "📋 В этой сессии файлы ещё не менялись."
+        unique = list(dict.fromkeys(self.changed_files))
+        lines = "\n".join(f"• <code>{f}</code>" for f in unique)
+        return (
+            f"📋 <b>Отчёт сессии</b> <code>{self.session_id}</code>\n\n"
+            f"Изменённые файлы ({len(unique)}):\n{lines}\n\n"
+            f"Откат: /code_rollback"
+        )
+
+    def rollback(self) -> str:
+        parts: list[str] = []
+
+        # 1) Файлы
+        file_msg = self._do_rollback(self.session_id)
+        parts.append(file_msg)
+
+        # 2) Страницы (custom text)
+        pages_restored = 0
+        if getattr(self, "page_snapshots", None):
+            try:
+                from database.db_pages import update_page_custom
+                for page_key, old_text in list(self.page_snapshots.items()):
+                    if old_text is None:
+                        # Нечего восстанавливать — пропускаем
+                        continue
+                    update_page_custom(page_key, text=old_text)
+                    pages_restored += 1
+                self.page_snapshots = {}
+            except Exception as e:
+                parts.append(f"❌ Ошибка отката страниц: {e}")
+
+        if pages_restored:
+            parts.append(f"🔄 Восстановлено страниц: {pages_restored}.")
+
+        self.changed_files = []
+        return "\n".join(parts)
+
+    def _safe_path(self, rel_path: str) -> str:
+        clean = (rel_path or ".").lstrip("/").replace("\\", "/")
+        for bad in FORBIDDEN_PREFIXES:
+            if clean == bad.rstrip("/") or clean.startswith(bad):
+                raise PermissionError(f"Доступ запрещён: {rel_path}")
+        full = os.path.abspath(os.path.join(BASE_DIR, clean))
+        if not full.startswith(BASE_DIR):
+            raise PermissionError(f"Выход за пределы проекта: {rel_path}")
+        return full
+
+    def _snapshot_file(self, rel_path: str) -> None:
+        full_path = self._safe_path(rel_path)
+        if not os.path.exists(full_path):
+            return
+        snap_path = os.path.join(SNAPSHOT_DIR, self.session_id, rel_path.lstrip("/"))
+        if os.path.exists(snap_path):
+            return
+        os.makedirs(os.path.dirname(snap_path), exist_ok=True)
+        shutil.copy2(full_path, snap_path)
+
+    def _do_rollback(self, session_id: str) -> str:
+        session_snap_dir = os.path.join(SNAPSHOT_DIR, session_id)
+        if not os.path.exists(session_snap_dir):
+            return "⚠️ Снапшот не найден, откат невозможен."
+        restored = 0
+        for root, _, files in os.walk(session_snap_dir):
+            for file in files:
+                snap_full = os.path.join(root, file)
+                rel_path = os.path.relpath(snap_full, session_snap_dir)
+                orig_full = self._safe_path(rel_path)
+                os.makedirs(os.path.dirname(orig_full), exist_ok=True)
+                shutil.copy2(snap_full, orig_full)
+                restored += 1
+        shutil.rmtree(session_snap_dir, ignore_errors=True)
+        return f"🔄 Восстановлено файлов: {restored}."
+
+    def list_files(self, rel_dir: str = ".") -> str:
+        try:
+            target = self._safe_path(rel_dir)
+            files_list: list[str] = []
+            for root, dirs, files in os.walk(target):
+                dirs[:] = [
+                    d
+                    for d in dirs
+                    if d not in {"venv", ".git", "__pycache__", ".snapshots", "node_modules"}
+                ]
+                for file in files:
+                    full = os.path.join(root, file)
+                    rel = os.path.relpath(full, BASE_DIR)
+                    files_list.append(rel)
+                    if len(files_list) >= 150:
+                        break
+            return json.dumps(files_list, ensure_ascii=False)
+        except Exception as e:
+            return f"Ошибка: {e}"
+
+    def read_file(self, rel_path: str) -> str:
+        try:
+            full = self._safe_path(rel_path)
+            if not os.path.exists(full):
+                return f"Файл {rel_path} не найден."
+            with open(full, encoding="utf-8") as f:
+                content = f.read()
+            if len(content) > 80000:
+                return content[:80000] + "\n\n… (файл обрезан)"
+            return content
+        except Exception as e:
+            return f"Ошибка чтения {rel_path}: {e}"
+
+    def write_file(self, rel_path: str, content: str) -> str:
+        try:
+            full = self._safe_path(rel_path)
+            if full.endswith(".py"):
+                try:
+                    ast.parse(content)
+                except SyntaxError as err:
+                    return (
+                        f"❌ Отклонено: синтаксис (строка {err.lineno}): {err.msg}"
+                    )
+            self._snapshot_file(rel_path)
+            os.makedirs(os.path.dirname(full) or BASE_DIR, exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(content)
+            if rel_path not in self.changed_files:
+                self.changed_files.append(rel_path)
+            return f"✅ Файл {rel_path} сохранён (снапшот создан)."
+        except Exception as e:
+            return f"❌ Ошибка записи {rel_path}: {e}"
+
+    async def restart_and_test_bot(self) -> str:
+        try:
+            res = subprocess.run(
+                ["systemctl", "restart", "xfi-connect"],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode != 0:
+                rb = self._do_rollback(self.session_id)
+                subprocess.run(["systemctl", "restart", "xfi-connect"])
+                self.changed_files = []
+                return f"❌ Ошибка restart. {rb}\n{res.stderr}"
+
+            await asyncio.sleep(6)
+
+            status = subprocess.run(
+                ["systemctl", "is-active", "xfi-connect"],
+                capture_output=True,
+                text=True,
+            )
+            is_active = status.stdout.strip() == "active"
+            logs_res = subprocess.run(
+                ["journalctl", "-u", "xfi-connect", "-n", "40", "--no-pager"],
+                capture_output=True,
+                text=True,
+            )
+            logs = logs_res.stdout or ""
+            has_error = (
+                "Traceback (most recent call last):" in logs
+                or "CRITICAL" in logs
+                or not is_active
+            )
+
+            if not has_error:
+                shutil.rmtree(
+                    os.path.join(SNAPSHOT_DIR, self.session_id),
+                    ignore_errors=True,
+                )
+                return "✅ Бот перезапущен, healthcheck OK."
+
+            rb = self._do_rollback(self.session_id)
+            subprocess.run(["systemctl", "restart", "xfi-connect"])
+            self.changed_files = []
+            return (
+                "🚨 Бот упал после правок. Выполнен rollback.\n"
+                f"{rb}\n\nЛог:\n```\n{logs[-1200:]}\n```"
+            )
+        except Exception as e:
+            rb = self._do_rollback(self.session_id)
+            subprocess.run(["systemctl", "restart", "xfi-connect"])
+            self.changed_files = []
+            return f"❌ Исключение healthcheck: {e}. {rb}"
+
+    def list_pages(self) -> str:
+        try:
+            from database.db_pages import get_page_keys
+            keys = sorted(get_page_keys())
+            return json.dumps(keys, ensure_ascii=False)
+        except Exception as e:
+            return f"Ошибка list_pages: {e}"
+
+    def get_page_data(self, page_key: str) -> str:
+        try:
+            from database.db_pages import get_page
+            page = get_page(page_key)
+            if not page:
+                return f"Страница {page_key} не найдена"
+            return json.dumps(page, ensure_ascii=False, default=str)
+        except Exception as e:
+            return f"Ошибка get_page: {e}"
+
+    def set_page_text(self, page_key: str, new_text: str) -> str:
+        try:
+            from database.db_pages import get_page, update_page_custom
+
+            # Снапшот текста страницы один раз за сессию
+            if page_key not in self.page_snapshots:
+                old = get_page(page_key)
+                old_text = None
+                if old:
+                    # custom text if set, else effective/default
+                    old_text = old.get("text") or old.get("text_custom") or old.get("text_default")
+                self.page_snapshots[page_key] = old_text
+
+            update_page_custom(page_key, text=new_text)
+            marker = f"page:{page_key}"
+            if marker not in self.changed_files:
+                self.changed_files.append(marker)
+            return f"✅ Текст страницы {page_key} обновлён (custom). Rollback страницы доступен."
+        except Exception as e:
+            return f"❌ set_page_text: {e}"
+
+
+
+    def _trim_messages(self, max_messages: int = 24) -> None:
+        if len(self.messages) > max_messages:
+            self.messages = self.messages[-max_messages:]
+
+    def _session_memory_note(self) -> str:
+        bits = []
+        if getattr(self, "changed_files", None):
+            bits.append("Изменения в сессии: " + ", ".join(self.changed_files[-12:]))
+        plan = getattr(self, "pending_plan", None)
+        if plan:
+            bits.append("Активный план:\n" + plan[:1000])
+        facts = getattr(self, "memory_facts", None) or []
+        if facts:
+            bits.append("Факты:\n- " + "\n- ".join(facts[-8:]))
+        return "\n".join(bits)
+
+    def run_ruff(self, rel_path: str = "bot", fix: bool = False) -> str:
+        """Ruff linter. fix=True only when user asked to autofix."""
+        import subprocess
+        try:
+            target = self._safe_path(rel_path)
+        except Exception as e:
+            return f"Ошибка пути: {e}"
+        ruff_bin = os.path.join(BASE_DIR, "venv", "bin", "ruff")
+        if not os.path.isfile(ruff_bin):
+            ruff_bin = "ruff"
+        cmd = [ruff_bin, "check", target, "--output-format=concise"]
+        if fix:
+            cmd.append("--fix")
+        try:
+            p = subprocess.run(
+                cmd, cwd=BASE_DIR, capture_output=True, text=True, timeout=90,
+            )
+            out = ((p.stdout or "") + (p.stderr or "")).strip()
+            if not out:
+                out = "OK: замечаний нет" if p.returncode == 0 else f"ruff exit {p.returncode}"
+            if len(out) > 6000:
+                out = out[:6000] + "\n… (обрезано)"
+            return out
+        except FileNotFoundError:
+            return "Ruff не установлен: /root/XFI_CONNECT/venv/bin/pip install ruff"
+        except Exception as e:
+            return f"ruff error: {e}"
+
+    async def _run_tool(self, name: str, args: dict) -> str:
+        if name == "run_ruff":
+            return self.run_ruff(args.get("rel_path") or "bot", bool(args.get("fix")))
+        if name == "list_files":
+            return self.list_files(args.get("rel_dir") or ".")
+        if name == "read_file":
+            return self.read_file(args["rel_path"])
+        if name == "write_file":
+            return self.write_file(args["rel_path"], args["content"])
+        if name == "list_pages":
+            return self.list_pages()
+        if name == "get_page":
+            return self.get_page_data(args["page_key"])
+        if name == "set_page_text":
+            return self.set_page_text(args["page_key"], args["new_text"])
+        if name == "restart_and_test_bot":
+            return await self.restart_and_test_bot()
+
+        if name in {
+            "set_page_media",
+            "set_page_buttons",
+            "patch_page_button_text",
+            "get_broadcast_draft",
+            "set_broadcast_message_draft",
+        }:
+            return await execute_phase2_tool(name, args)
+
+        if name in {
+            "list_tariffs",
+            "get_tariff",
+            "update_tariff_price",
+            "list_promo_codes",
+            "preview_panel_sync",
+            "confirm_panel_sync",
+        }:
+            return await execute_phase3_tool(name, args)
+
+
+        if name in {
+            "adjust_user_balance",
+            "set_page_button_hidden",
+            "check_panel_health",
+            "set_referral_coefficient",
+            "get_user_payments_stats",
+        }:
+            return await execute_phase4_tool(name, args)
+
+
+        if name in {
+            "list_inbounds",
+            "get_inbound",
+            "check_inbound_health",
+        }:
+            return await execute_phase5_tool(name, args)
+
+        return await execute_yaadmin_tool(name, args)
+
+    def _models(self) -> list[str]:
+        return [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+        ]
+
+    async def chat(self, user_text: str) -> str:
+        if not self.client:
+            return "❌ GROQ_API_KEY не найден в config.py"
+
+        self.messages.append({"role": "user", "content": user_text})
+        self._trim_messages(24)
+
+        for model_name in self._models():
+            last_tool_results: list[tuple[str, str]] = []
+            try:
+                for _ in range(6):
+                    response = await self.client.chat.completions.create(
+                        timeout=60.0,
+                        model=model_name,
+                        messages=[{"role": "system", "content": SYSTEM_PROMPT + (("\n\n[Память сессии]\n" + self._session_memory_note()) if self._session_memory_note() else "")}]
+                        + self.messages,
+                        tools=TOOLS + YAADMIN_TOOLS + PHASE2_TOOLS + PHASE3_TOOLS + PHASE4_TOOLS + PHASE5_TOOLS,
+                        tool_choice="auto",
+                        temperature=0.1,
+                    )
+                    msg = response.choices[0].message
+                    payload: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": msg.content or "",
+                    }
+                    if msg.tool_calls:
+                        payload["tool_calls"] = [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments or "{}",
+                                },
+                            }
+                            for tc in msg.tool_calls
+                        ]
+                    self.messages.append(payload)
+
+                    if not msg.tool_calls:
+                        text = (msg.content or "Готово.").strip()
+                        if any(x in text.lower() for x in ("план", "предлагаю", "можно исправить", "заменить")):
+                            self.pending_plan = text[:1500]
+                        if len(text) < 400 and text not in (getattr(self, "memory_facts") or []):
+                            pass  # facts optional
+                        # Если модель не процитировала tool — добавим последние результаты
+                        vague = (
+                            len(text) < 80
+                            or text.lower().startswith("сделано")
+                            or "получен" in text.lower()
+                            and "page" not in text.lower()
+                            and len(text) < 200
+                        )
+                        if vague and last_tool_results:
+                            chunks = []
+                            for tn, tr in last_tool_results[-3:]:
+                                chunks.append(f"[{tn}]\n{tr[:3500]}")
+                            text = text + "\n\n" + "\n\n".join(chunks)
+                        if self.changed_files:
+                            text += "\n\n" + self.report()
+                        return text
+
+                    for tc in msg.tool_calls:
+                        try:
+                            args = json.loads(tc.function.arguments or "{}")
+                        except json.JSONDecodeError:
+                            args = {}
+                        result = await self._run_tool(tc.function.name, args)
+                        last_tool_results.append((tc.function.name, result))
+                        self.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": result,
+                            }
+                        )
+                return "⚠️ Слишком много шагов tool-calling (лимит Groq/цикл).\nПопробуй более узкий запрос через 1–2 мин, например: «статистика ключей»."
+            except Exception as e:
+                logger.warning("Модель %s: %s", model_name, e)
+                continue
+
+        return "❌ Ни одна модель Groq не смогла выполнить задачу."
+
+    async def execute_task(self, prompt: str) -> str:
+        """Совместимость со старым хендлером /code."""
+        self.new_session()
+        return await self.chat(prompt)

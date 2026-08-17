@@ -33,7 +33,7 @@ async def renew_key_access(
         'sync_stats': {},
     }
 
-    if not key_id or days is None:
+    if not key_id or not days:
         return result
 
     paid_traffic_limit: Optional[int] = None

@@ -6,6 +6,7 @@ from typing import Any, Iterable, Mapping
 
 from bot.services.money import format_money_minor
 from bot.utils.user_ui_texts import render_ui_text
+from bot.utils.key_pages import resolve_key_display_name
 
 
 def build_tariff_button_items(
@@ -128,7 +129,9 @@ def build_protocol_button_items(
 def build_key_button_items(keys: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Return key data/actions with statuses from the cached UI catalog."""
     items: list[dict[str, Any]] = []
-    for key in keys:
+    for index, key in enumerate(keys, start=1):
+        key = dict(key)
+        key['_list_index'] = index
         traffic_limit = int(key.get('traffic_limit') or 0)
         traffic_used = int(key.get('traffic_used') or 0)
         if traffic_limit > 0 and traffic_used >= traffic_limit:
@@ -144,7 +147,7 @@ def build_key_button_items(keys: Iterable[Mapping[str, Any]]) -> list[dict[str, 
         items.append({
             'callback_data': f'key:{key_id}',
             'data': {
-                'item_name': str(key.get('display_name') or f'#{key_id}'),
+                'item_name': resolve_key_display_name(key, key.get('_list_index') or None),
                 'item_status': render_ui_text(status_key),
                 'item_status_indicator': status_indicator,
             },

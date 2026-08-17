@@ -24,6 +24,9 @@ from bot.handlers.admin.groups import router as groups_router
 from bot.handlers.admin.yadreno_admin import router as yadreno_admin_router
 from bot.handlers.admin.support import router as support_router
 from bot.handlers.admin.customization_reset import router as customization_reset_router
+from bot.handlers.admin.code_editor import router as code_editor_router
+from bot.handlers.admin.dev_agent import router as dev_agent_router
+from bot.handlers.admin.yaa_local import router as yaa_local_router
 
 admin_router = Router()
 
@@ -49,3 +52,7 @@ admin_router.include_router(coupon_generator_router)
 admin_router.include_router(yadreno_admin_router)
 admin_router.include_router(customization_reset_router)
 
+# AI code tools
+admin_router.include_router(code_editor_router)
+admin_router.include_router(dev_agent_router)
+admin_router.include_router(yaa_local_router)

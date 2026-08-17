@@ -10,6 +10,24 @@ from bot.utils.user_ui_texts import render_ui_text
 
 KEY_HISTORY_PLACEHOLDER = '%ключ_история_операций%'
 
+def resolve_key_display_name(key: Mapping[str, Any], index: int | None = None) -> str:
+    """User-visible key title: real custom name, else Ключ №N."""
+    custom = (key.get("display_name") or key.get("custom_name") or "").strip()
+    if custom:
+        low = custom.lower()
+        if custom.startswith("#") and custom[1:].isdigit():
+            custom = ""
+        elif low.startswith("user_") or low.startswith("user..."):
+            custom = ""
+        elif "user..." in low:
+            custom = ""
+    if custom:
+        return custom
+    if index is not None and int(index) > 0:
+        return f"Ключ №{int(index)}"
+    kid = key.get("id", "")
+    return f"Ключ №{kid}" if kid != "" else "Ключ"
+
 
 def _default_key_status(key: Mapping[str, Any]) -> str:
     traffic_used = key.get('traffic_used', 0) or 0
@@ -56,7 +74,7 @@ def build_key_page_context(
     protocol: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Builds the allowlisted display context for ``%key(field=...)%``."""
-    display_name = key.get('display_name') or f"#{key.get('id', '')}"
+    display_name = resolve_key_display_name(key, key.get("_list_index"))
     server = key.get('server_name') or '—'
     expires = format_date_for_display(key.get('expires_at'))
     tariff = key.get('tariff_name') or '—'

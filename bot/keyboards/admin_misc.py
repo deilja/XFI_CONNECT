@@ -52,36 +52,34 @@ def home_only_kb() -> InlineKeyboardMarkup:
     builder.row(home_button())
     return builder.as_markup()
 
+
 def admin_main_menu_kb() -> InlineKeyboardMarkup:
     """Main menu of the admin panel."""
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text='🖥️ Сервера', callback_data='admin_servers'),
-        InlineKeyboardButton(text='💳 Оплаты', callback_data='admin_payments')
+        InlineKeyboardButton(text='💳 Оплаты', callback_data='admin_payments'),
     )
     builder.row(
         InlineKeyboardButton(text='👥 Пользователи', callback_data='admin_users'),
-        InlineKeyboardButton(text='📣 Маркетинг', callback_data='admin_marketing')
+        InlineKeyboardButton(text='📣 Маркетинг', callback_data='admin_marketing'),
     )
     builder.row(
         InlineKeyboardButton(text='⚙️ Настройки бота', callback_data='admin_bot_settings'),
-        InlineKeyboardButton(text='🧩 Расширения', callback_data='admin_extensions_diagnostics')
+        InlineKeyboardButton(text='🧩 Расширения', callback_data='admin_extensions_diagnostics'),
     )
     builder.row(
         InlineKeyboardButton(
-            text='🛠 Кастомизация YadrenoVPN',
-            callback_data='admin_yadreno_customization',
-            style='primary',
+            text='🛠 ИИ DevAgent',
+            callback_data='admin_code_agent',
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text='🤖 Yadreno Admin',
-            callback_data='admin_yadreno',
-            style='primary',
+            text='🛠 Кастомизация (DevAgent)',
+            callback_data='admin_code_agent',
         )
     )
-    builder.row(InlineKeyboardButton(text='🤍 Поддержка автора', callback_data='admin_author_support', style='success'))
     builder.row(home_button())
     return builder.as_markup()
 

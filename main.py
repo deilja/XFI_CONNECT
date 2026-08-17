@@ -3,6 +3,7 @@ VPN Telegram bot entry point.
 
 Initializes the bot, dispatcher, applies migrations and starts polling.
 """
+from bot.handlers import ai, admin_ai
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
@@ -174,12 +175,14 @@ async def main():
     bot_blocked_reset = BotBlockedResetMiddleware()
     dp.message.outer_middleware(bot_blocked_reset)
     dp.callback_query.outer_middleware(bot_blocked_reset)
-    
+    dp.include_router(admin_ai.router)
+
     # Registering routers
     # The order is important: first the more specific, then the general
     dp.include_router(admin_router)           # Admin panel (general)
     dp.include_router(user_router)            # User (has a strict internal order)
-    
+    dp.include_router(ai.router)
+
     # Global Network Error Handler
     from aiogram.exceptions import TelegramNetworkError
     from aiogram.types import ErrorEvent

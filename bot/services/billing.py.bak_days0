@@ -395,7 +395,7 @@ async def _process_payment_order_unlocked(
         return ""
 
     user_internal_id = order['user_id']
-    days = order['period_days'] if order.get('period_days') is not None else (order['duration_days'] if order.get('duration_days') is not None else 30)
+    days = order.get('period_days') or order.get('duration_days') or 30
 
     if order['vpn_key_id']:
         from bot.services.key_lifecycle import renew_key_access
@@ -405,7 +405,7 @@ async def _process_payment_order_unlocked(
             reset_traffic=True,
             tariff_id=order.get('tariff_id'),
         )
-        if renew_result['db_updated']:
+        if days and renew_result['db_updated']:
             logger.info(f"Ключ {order['vpn_key_id']} продлён на {days} дней (order={order_id})")
             if not renew_result['panel_synced']:
                 logger.warning(
@@ -436,7 +436,7 @@ async def _process_payment_order_unlocked(
             raise TariffNotFoundError()
         
         try:
-            days = order['period_days'] if order.get('period_days') is not None else (order['duration_days'] if order.get('duration_days') is not None else 30)
+            days = order.get('period_days') or order.get('duration_days') or 30
             # We get the traffic limit from the tariff
             from database.requests import get_tariff_by_id as _get_tariff
             _tariff = _get_tariff(order['tariff_id'])
@@ -1698,7 +1698,7 @@ async def _run_payment_post_actions(
                 payment_type,
             )
 
-    days = order['period_days'] if order.get('period_days') is not None else (order['duration_days'] if order.get('duration_days') is not None else 30)
+    days = order.get('period_days') or order.get('duration_days') or 30
     await process_referral_reward(
         user_internal_id,
         days,
