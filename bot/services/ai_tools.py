@@ -1,5 +1,5 @@
 """
-Инструменты AI-агента для YadrenoVPN.
+Инструменты AI-агента для XFI_CONNECT.
 Базовый набор: мониторинг, ключи, кастомизация страниц.
 """
 from __future__ import annotations
@@ -184,6 +184,8 @@ async def execute_tool(name: str, args: dict) -> str:
         elif name == "get_expiring_keys":
             from database.db_stats import get_expiring_keys
             days = int(args.get("days") or 3)
+            if days < 0:
+                return _err("days не может быть отрицательным")
             return _ok(get_expiring_keys(days))
 
         elif name == "search_key":
@@ -203,12 +205,19 @@ async def execute_tool(name: str, args: dict) -> str:
             return _ok(keys)
 
         elif name == "extend_key":
-            from database.db_keys import extend_vpn_key
+            from bot.services.key_lifecycle import renew_key_access
 
             key_id = int(args["key_id"])
             days = int(args["days"])
-            ok_db = extend_vpn_key(key_id, days)
-            return _ok({"db": ok_db, "key_id": key_id, "days": days})
+            if days <= 0:
+                return _err("Количество дней должно быть больше 0")
+            if days > 3650:
+                return _err("Нельзя продлить ключ более чем на 3650 дней за одну операцию")
+
+            result = await renew_key_access(key_id, days)
+            if not result.get("db_updated"):
+                return _err("Не удалось продлить ключ")
+            return _ok({"key_id": key_id, "days": days, **result})
 
         elif name == "reset_key_traffic":
             from database.db_keys import reset_key_traffic_notification
