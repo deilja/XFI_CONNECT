@@ -15,13 +15,19 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt pytest
       - name: Compile Python sources
         run: python -m compileall -q . -x '(^|/)(\.git|\.snapshots|__pycache__|venv)(/|$)'
-      - name: Crypto Pay service smoke test
+      - name: Import application modules
         run: |
           python - <<'PY'
+          import bot
+          import bot.handlers.admin
+          import bot.services.ai_agent
           import bot.services.cryptobot
           import bot.services.cryptobot_provider
-          print("Crypto Pay service imports: OK")
+          import bot.services.vpn_api
+          print("Application imports: OK")
           PY
+      - name: Run regression tests
+        run: pytest -q
