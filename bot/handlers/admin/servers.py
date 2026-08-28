@@ -546,6 +546,8 @@ async def process_add_step(message: Message, state: FSMContext):
         
         # Testing the connection
         test_result = await test_server_connection(server_data)
+        if test_result.get('panel_api_profile'):
+            server_data['panel_api_profile'] = test_result['panel_api_profile']
         await state.update_data(
             server_data=server_data,
             connection_test_passed=bool(test_result['success']),

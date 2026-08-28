@@ -19,6 +19,7 @@ from .panels.base import (
     build_inbound_descriptor,
 )
 from .panels.xui import XUIClient
+from .panels.amnezia import AmneziaClient, AMNEZIA_PROFILE
 from bot.utils.inbounds import split_ignored_inbounds
 from bot.utils.panel_email import is_managed_panel_email
 from bot.services.panel_key_state import should_panel_client_exist
@@ -254,8 +255,11 @@ def get_client_from_server_data(server: Dict[str, Any]) -> BaseVPNClient:
     if server_id in _clients:
         return _clients[server_id]
         
-    client = XUIClient(server)
-        
+    if str(server.get("panel_api_profile") or "").strip().lower() == AMNEZIA_PROFILE:
+        client = AmneziaClient(server)
+    else:
+        client = XUIClient(server)
+
     _clients[server_id] = client
     return client
 
@@ -363,11 +367,44 @@ async def test_server_connection(server_data: Dict[str, Any]) -> Dict[str, Any]:
     try:
         await client.login()
         stats = await client.get_stats()
-        return {'success': True, 'message': 'Подключение успешно!', 'stats': stats}
-    except VPNAPIError as e:
-        return {'success': False, 'message': f'Ошибка: {e}', 'stats': None}
+        return {
+            'success': True,
+            'message': 'Подключение к 3X-UI успешно!',
+            'stats': stats,
+            'panel_api_profile': getattr(client, 'api_profile', None) or 'legacy_inbounds',
+        }
+    except VPNAPIError as xui_error:
+        # The same server-management dialog can provision an Amnezia Admin API
+        # endpoint when the supplied API key is an Amnezia x-api-key.
+        try:
+            await client.close()
+        except Exception:
+            pass
+        amnezia = AmneziaClient(server_data)
+        try:
+            if await amnezia.health_check():
+                stats = await amnezia.get_stats()
+                return {
+                    'success': True,
+                    'message': 'Подключение к Amnezia Admin API успешно!',
+                    'stats': stats,
+                    'panel_api_profile': AMNEZIA_PROFILE,
+                }
+        finally:
+            await amnezia.close()
+        return {
+            'success': False,
+            'message': f'Ошибка 3X-UI/Amnezia API: {xui_error}',
+            'stats': None,
+        }
     finally:
-        await client.close()
+        if not client._session if hasattr(client, '_session') else False:
+            pass
+        else:
+            try:
+                await client.close()
+            except Exception:
+                pass
 
 @regular_panel_operation
 async def reset_key_traffic_if_active(key_id: int) -> bool:
