@@ -1,34 +1,30 @@
 import os
 
-# Telegram Bot API Token
 BOT_TOKEN = "ВАШ_ТОКЕН_БОТА"
 
-# Список Telegram ID администраторов
 ADMIN_IDS = [
     12345678,
 ]
 
-# Адрес Telegram Bot API
 TELEGRAM_API_URL = "https://api.telegram.org"
 
-# Client Configuration Defaults
+# Kept empty for compatibility with legacy internal modules; no remote update source is configured.
+GITHUB_REPO_URL = ""
+
 DEFAULT_LIMIT_IP = 1
 DEFAULT_TOTAL_GB = 1024 * 1024 * 1024 * 1024
 
-# Rate Limiting Configuration
 RATE_LIMITS = {
     "commands_per_minute": 30,
     "critical_operations_per_minute": 5,
 }
 
-# Retry Configuration for VPN API calls
 RETRY_CONFIG = {
     "max_attempts": 3,
     "delays": [1, 3, 9],
     "timeout_seconds": 15,
 }
 
-# SQLite Configuration
 SQLITE_JOURNAL_MODE = "WAL"
 SQLITE_SYNCHRONOUS = "NORMAL"
 SQLITE_BUSY_TIMEOUT_MS = 10000
