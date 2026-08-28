@@ -1,7 +1,7 @@
-"""
-Connecting admin panel routers.
-"""
-from aiogram import Router
+"""Connecting XFI CONNECT admin routers."""
+from aiogram import Router, F
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
 
 from bot.handlers.admin.main import router as main_router
 from bot.handlers.admin.message_editor import router as message_editor_router
@@ -31,6 +31,22 @@ from bot.handlers.admin.yaa_local import router as yaa_local_router
 
 admin_router = Router()
 
+# Legacy update entry points are intentionally blocked. Production changes are
+# made through the repository owner and are never pulled by the bot itself.
+update_disabled_router = Router()
+
+
+@update_disabled_router.message(Command("update"))
+async def update_command_disabled(message: Message):
+    await message.answer("Обновления через Telegram отключены в XFI CONNECT.")
+
+
+@update_disabled_router.callback_query(F.data.startswith("admin_update"))
+async def update_callback_disabled(callback: CallbackQuery):
+    await callback.answer("Обновления отключены", show_alert=True)
+
+
+admin_router.include_router(update_disabled_router)
 admin_router.include_router(main_router)
 admin_router.include_router(message_editor_router)
 admin_router.include_router(servers_router)
@@ -53,8 +69,6 @@ admin_router.include_router(coupons_router)
 admin_router.include_router(coupon_generator_router)
 admin_router.include_router(yadreno_admin_router)
 admin_router.include_router(customization_reset_router)
-
-# AI code tools
 admin_router.include_router(code_editor_router)
 admin_router.include_router(dev_agent_router)
 admin_router.include_router(yaa_local_router)
