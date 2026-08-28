@@ -23,6 +23,8 @@ def _install_amnezia_constructor():
             if isinstance(data, dict) and token.startswith("amnezia:"):
                 data["api_token"] = token.split(":", 1)[1].strip()
             return AmneziaClient(data)
+        if original_new is object.__new__:
+            return original_new(cls)
         return original_new(cls, server, *args, **kwargs)
 
     XUIClient.__new__ = staticmethod(_new)
