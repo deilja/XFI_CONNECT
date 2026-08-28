@@ -11,9 +11,10 @@ def test_supported_providers_are_stable():
     assert AIAgent._normalize_provider("GROK") == "grok"
 
 
-def test_unknown_provider_is_not_silently_accepted():
+def test_set_provider_rejects_unknown_provider():
+    agent = AIAgent(provider="groq")
     try:
-        AIAgent(provider="unsupported")
+        agent.set_provider("unsupported")
     except ValueError:
-        raise AssertionError("constructor must remain backward compatible")
-    assert AIAgent._normalize_provider("unsupported") == "unsupported"
+        return
+    raise AssertionError("unsupported provider was accepted")
