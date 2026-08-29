@@ -67,7 +67,18 @@ path.write_text(text, encoding="utf-8")
 PY
     ok "config.py создан"
 else
-    ok "Существующий config.py сохранён"
+    python3 - <<'PY'
+from pathlib import Path
+
+path = Path("config.py")
+text = path.read_text(encoding="utf-8")
+old = 'GITHUB_REPO_URL = ""'
+if old in text:
+    text = text.replace(old, 'GITHUB_REPO_URL = "https://github.com/deilja/XFI_CONNECT.git"', 1)
+    path.write_text(text, encoding="utf-8")
+    print("GITHUB_REPO_URL migrated to XFI CONNECT")
+PY
+    ok "Существующий config.py сохранён; updater привязан к XFI CONNECT"
 fi
 
 log "Настройка Python окружения"
