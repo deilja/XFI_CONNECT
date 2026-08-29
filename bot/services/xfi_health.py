@@ -1,13 +1,11 @@
 """Post-update service verification for XFI CONNECT.
 
-The verifier is deliberately independent from the bot process.  It is started
-before the updater restarts the bot and can therefore recover a bad release
-without relying on the updated Python process.
+The verifier runs independently of the bot process and detects both a stopped
+service and a systemd Restart=always crash loop.
 """
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -25,29 +23,66 @@ DEFAULT_SETTLE_SECONDS = 20
 DEFAULT_INTERVAL_SECONDS = 2
 
 
+def _service_state(service: str, root: Path) -> tuple[str, str, int, int]:
+    result = _run(
+        ["systemctl", "show", service, "--no-pager",
+         "--property=ActiveState", "--property=SubState",
+         "--property=NRestarts", "--property=MainPID"],
+        root, 15,
+    )
+    if result.returncode != 0:
+        return "unknown", "unknown", -1, 0
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value.strip()
+    try:
+        restarts = int(values.get("NRestarts", "0"))
+    except ValueError:
+        restarts = -1
+    try:
+        pid = int(values.get("MainPID", "0"))
+    except ValueError:
+        pid = 0
+    return values.get("ActiveState", "unknown"), values.get("SubState", "unknown"), restarts, pid
+
+
 def _service_active(service: str, root: Path) -> bool:
-    result = _run(["systemctl", "is-active", service], root, 15)
-    return result.returncode == 0 and result.stdout.strip() == "active"
+    active, substate, _, _ = _service_state(service, root)
+    return active == "active" and substate in {"running", "listening"}
 
 
 def verify_service(service: str, *, settle_seconds: int = DEFAULT_SETTLE_SECONDS,
                    interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
                    project_root: str | Path | None = None) -> bool:
     root = _root(project_root)
+    baseline_active, baseline_substate, baseline_restarts, _ = _service_state(service, root)
+    if baseline_active != "active" or baseline_substate not in {"running", "listening"}:
+        return False
+
     deadline = time.monotonic() + max(1, int(settle_seconds))
     interval = max(1, int(interval_seconds))
     while time.monotonic() < deadline:
-        if not _service_active(service, root):
+        active, substate, restarts, _ = _service_state(service, root)
+        if active != "active" or substate not in {"running", "listening"}:
+            return False
+        if baseline_restarts >= 0 and restarts >= 0 and restarts > baseline_restarts:
             return False
         time.sleep(min(interval, max(0.1, deadline - time.monotonic())))
-    return _service_active(service, root)
+
+    active, substate, restarts, _ = _service_state(service, root)
+    return (
+        active == "active"
+        and substate in {"running", "listening"}
+        and (baseline_restarts < 0 or restarts < 0 or restarts == baseline_restarts)
+    )
 
 
 def schedule_post_update_check(snapshot_id: str, *, service_name: str = SERVICE_NAME,
                                project_root: str | Path | None = None,
                                settle_seconds: int = DEFAULT_SETTLE_SECONDS) -> tuple[bool, str]:
     root = _root(project_root)
-    # Validate the snapshot before creating an external worker.
     get_rollback_point(snapshot_id, project_root=root, verify_integrity=True)
     unit = f"xfi-connect-health-{snapshot_id[:23].lower()}"
     result = _run([
