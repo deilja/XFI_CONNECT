@@ -22,7 +22,6 @@ from bot.handlers.admin.promotions import router as promotions_router
 from bot.handlers.admin.coupons import router as coupons_router
 from bot.handlers.admin.coupon_generator import router as coupon_generator_router
 from bot.handlers.admin.groups import router as groups_router
-from bot.handlers.admin.yadreno_admin import router as yadreno_admin_router
 from bot.handlers.admin.support import router as support_router
 from bot.handlers.admin.customization_reset import router as customization_reset_router
 from bot.handlers.admin.code_editor import router as code_editor_router
@@ -67,7 +66,6 @@ admin_router.include_router(referral_router)
 admin_router.include_router(promotions_router)
 admin_router.include_router(coupons_router)
 admin_router.include_router(coupon_generator_router)
-admin_router.include_router(yadreno_admin_router)
 admin_router.include_router(customization_reset_router)
 admin_router.include_router(code_editor_router)
 admin_router.include_router(dev_agent_router)
