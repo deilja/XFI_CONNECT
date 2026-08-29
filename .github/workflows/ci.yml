@@ -31,4 +31,6 @@ jobs:
           print("XFI updater imports: OK")
           PY
       - name: Run regression tests
+        env:
+          PYTHONPATH: .
         run: pytest -q tests/test_xfi_update.py tests/test_ai_agent.py
