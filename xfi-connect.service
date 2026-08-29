@@ -1,0 +1,17 @@
+[Unit]
+Description=XFI CONNECT Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/XFI_CONNECT
+ExecStart=/root/XFI_CONNECT/venv/bin/python /root/XFI_CONNECT/main.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
