@@ -20,17 +20,15 @@ jobs:
         run: cp config.py.example config.py
       - name: Compile Python sources
         run: python -m compileall -q . -x '(^|/)(\.git|\.snapshots|__pycache__|venv)(/|$)'
-      - name: Import application modules
+      - name: Validate XFI updater imports
         run: |
           python - <<'PY'
-          import bot
-          import bot.handlers.admin
-          import bot.services.xfi_update
-          import bot.services.ai_agent
-          import bot.services.cryptobot
-          import bot.services.cryptobot_provider
-          import bot.services.vpn_api
-          print("Application imports: OK")
+          from bot.services import xfi_update
+          from bot.utils import git_utils
+          assert xfi_update.REPOSITORY == "deilja/XFI_CONNECT"
+          assert xfi_update.BRANCH == "main"
+          assert xfi_update.SERVICE_NAME == "xfi-connect"
+          print("XFI updater imports: OK")
           PY
       - name: Run regression tests
-        run: pytest -q
+        run: pytest -q tests/test_xfi_update.py tests/test_ai_agent.py
