@@ -8,8 +8,8 @@ ADMIN_IDS = [
 
 TELEGRAM_API_URL = "https://api.telegram.org"
 
-# Kept empty for compatibility with legacy internal modules; no remote update source is configured.
-GITHUB_REPO_URL = ""
+# XFI CONNECT updater is repository-bound; origin must point to this repository.
+GITHUB_REPO_URL = "https://github.com/deilja/XFI_CONNECT.git"
 
 DEFAULT_LIMIT_IP = 1
 DEFAULT_TOTAL_GB = 1024 * 1024 * 1024 * 1024
