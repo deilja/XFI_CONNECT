@@ -23,14 +23,15 @@ jobs:
       - name: Validate XFI updater imports
         run: |
           python - <<'PY'
-          from bot.services import xfi_update
+          from bot.services import xfi_update, xfi_health
           from bot.utils import git_utils
           assert xfi_update.REPOSITORY == "deilja/XFI_CONNECT"
           assert xfi_update.BRANCH == "main"
           assert xfi_update.SERVICE_NAME == "xfi-connect"
+          assert xfi_health.SERVICE_NAME == "xfi-connect"
           print("XFI updater imports: OK")
           PY
       - name: Run regression tests
         env:
           PYTHONPATH: .
-        run: pytest -q tests/test_xfi_update.py tests/test_ai_agent.py
+        run: pytest -q tests/test_xfi_update.py tests/test_xfi_health.py tests/test_ai_agent.py
