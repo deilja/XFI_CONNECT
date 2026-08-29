@@ -1,12 +1,12 @@
 """Git compatibility API backed by the XFI CONNECT update engine.
 
-This module intentionally contains no legacy updater implementation. Public
-helpers are retained because existing handlers/extensions import them.
+This module contains no legacy updater implementation. Public helpers are
+retained because existing handlers/extensions import them.
 """
 from __future__ import annotations
 
 import os
-import subprocess
+import re
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -19,14 +19,12 @@ from bot.services.xfi_update import (
     _commit,
     _root,
     _run,
-    _subject,
-    _release,
     create_pre_update_snapshot,
     discard_prepared_snapshot,
     finalize_snapshot_after_git,
-    mark_snapshot_applied,
     update_operation_lock,
 )
+from bot.services.xfi_health import schedule_post_update_check
 
 
 def get_project_root() -> str:
@@ -47,7 +45,8 @@ def check_git_available() -> bool:
 
 def get_current_commit(*, full: bool = False) -> Optional[str]:
     try:
-        return _commit(_root()) if full else _commit(_root())[:8]
+        commit = _commit(_root())
+        return commit if full else commit[:8]
     except Exception:
         return None
 
@@ -63,10 +62,13 @@ def get_remote_url() -> Optional[str]:
 
 
 def set_remote_url(url: str) -> Tuple[bool, str]:
-    """Set origin only when it resolves to the fixed XFI CONNECT repository."""
+    """Compatibility API: only accept the canonical XFI CONNECT origin."""
     normalized = (url or "").strip().lower().rstrip("/")
     normalized = normalized[:-4] if normalized.endswith(".git") else normalized
-    allowed = ("https://github.com/deilja/xfi_connect", "git@github.com:deilja/xfi_connect")
+    allowed = (
+        "https://github.com/deilja/xfi_connect",
+        "git@github.com:deilja/xfi_connect",
+    )
     if normalized not in allowed:
         return False, f"origin must remain {REPOSITORY}"
     return run_git_command(["remote", "set-url", "origin", url])
@@ -75,7 +77,8 @@ def set_remote_url(url: str) -> Tuple[bool, str]:
 def get_pending_commits_list() -> Tuple[bool, List[Dict[str, str]]]:
     root = _root()
     try:
-        _checked(["git", "fetch", "--prune", "origin", BRANCH], root, stage="Fetching XFI CONNECT", timeout=120)
+        _checked(["git", "fetch", "--prune", "origin", BRANCH], root,
+                 stage="Fetching XFI CONNECT", timeout=120)
         result = _run(["git", "log", f"HEAD..origin/{BRANCH}", "--format=%H|%s", "--reverse"], root, 30)
         if result.returncode:
             return False, []
@@ -113,26 +116,49 @@ def _apply_target(target: str, *, mode: str, actor: Optional[str]) -> Tuple[bool
         return False, blocked
     try:
         with update_operation_lock(root):
-            status = _checked(["git", "status", "--porcelain"], root, stage="Checking worktree", timeout=30)
+            status = _checked(["git", "status", "--porcelain"], root,
+                              stage="Checking worktree", timeout=30)
             if status.strip():
                 return False, "❌ Есть локальные изменения. Сделайте commit или stash перед обновлением."
             source = _commit(root)
-            snapshot = create_pre_update_snapshot(update_mode=mode, requested_target=target, actor=actor, project_root=root)
-            rescue = None
+            snapshot = create_pre_update_snapshot(
+                update_mode=mode,
+                requested_target=target,
+                actor=actor,
+                project_root=root,
+            )
             try:
-                _checked(["git", "reset", "--hard", target], root, stage="Applying XFI CONNECT update", timeout=120)
+                _checked(["git", "reset", "--hard", target], root,
+                         stage="Applying XFI CONNECT update", timeout=120)
                 try:
-                    _checked([sys.executable, "-m", "pip", "install", "--upgrade", "-r", str(root / "requirements.txt")], root,
-                             stage="Installing XFI CONNECT dependencies", timeout=600)
+                    _checked(
+                        [sys.executable, "-m", "pip", "install", "--upgrade", "-r", str(root / "requirements.txt")],
+                        root, stage="Installing XFI CONNECT dependencies", timeout=600,
+                    )
                 except Exception:
-                    _checked(["git", "reset", "--hard", source], root, stage="Recovering failed update", timeout=120)
+                    _checked(["git", "reset", "--hard", source], root,
+                             stage="Recovering failed update", timeout=120)
                     discard_prepared_snapshot(snapshot.snapshot_id, project_root=root)
                     raise
-                finalize_snapshot_after_git(snapshot, git_succeeded=True, project_root=root)
+                if not finalize_snapshot_after_git(snapshot, git_succeeded=True, project_root=root):
+                    raise UpdateRollbackError("XFI update did not change the installed commit")
+
+                health_ok, health_unit = schedule_post_update_check(
+                    snapshot.snapshot_id,
+                    service_name=SERVICE_NAME,
+                    project_root=root,
+                    settle_seconds=20,
+                )
+                if not health_ok:
+                    return False, f"❌ Обновление установлено, но health-check worker не запущен: {health_unit}"
+
                 info = get_last_commit_info("HEAD")
-                return True, f"✅ XFI CONNECT обновлён.\n\n<pre>{info}</pre>"
-            except Exception:
-                raise
+                return (
+                    True,
+                    f"✅ XFI CONNECT обновлён.\n\n<pre>{info}</pre>\n"
+                    f"Health-check: <code>{health_unit}</code>\n"
+                    "При неудачном старте будет выполнен автоматический rollback.",
+                )
     except UpdateRollbackError as exc:
         return False, f"❌ Обновление остановлено: {exc}"
     except Exception as exc:
@@ -140,10 +166,10 @@ def _apply_target(target: str, *, mode: str, actor: Optional[str]) -> Tuple[bool
 
 
 def pull_to_commit(commit_hash: str, *, update_mode: str = "admin_target_commit", actor: Optional[str] = None) -> Tuple[bool, str]:
-    if not isinstance(commit_hash, str) or not __import__("re").fullmatch(r"[0-9a-fA-F]{40,64}", commit_hash):
+    if not isinstance(commit_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit_hash):
         return False, "❌ Некорректный идентификатор коммита"
     root = _root()
-    if not _run(["git", "cat-file", "-e", f"{commit_hash}^{{commit}}"], root, 30).returncode == 0:
+    if _run(["git", "cat-file", "-e", f"{commit_hash}^{{commit}}"], root, 30).returncode != 0:
         run_git_command(["fetch", "--prune", "origin", BRANCH], 120)
     if _run(["git", "cat-file", "-e", f"{commit_hash}^{{commit}}"], root, 30).returncode != 0:
         return False, "❌ Целевой коммит недоступен локально"
@@ -153,8 +179,10 @@ def pull_to_commit(commit_hash: str, *, update_mode: str = "admin_target_commit"
 def pull_updates(*, update_mode: str = "admin_pull", actor: Optional[str] = None) -> Tuple[bool, str]:
     root = _root()
     try:
-        _checked(["git", "fetch", "--prune", "origin", BRANCH], root, stage="Fetching XFI CONNECT", timeout=120)
-        target = _checked(["git", "rev-parse", f"origin/{BRANCH}"], root, stage="Resolving XFI target", timeout=30).splitlines()[0].strip()
+        _checked(["git", "fetch", "--prune", "origin", BRANCH], root,
+                 stage="Fetching XFI CONNECT", timeout=120)
+        target = _checked(["git", "rev-parse", f"origin/{BRANCH}"], root,
+                          stage="Resolving XFI target", timeout=30).splitlines()[0].strip()
     except Exception as exc:
         return False, f"❌ Не удалось получить XFI CONNECT: {exc}"
     return _apply_target(target, mode=update_mode, actor=actor)
