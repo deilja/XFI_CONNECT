@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 
 import config
 from bot.ai_context import context_for
+from bot.services.ai_key_store import AIKeyStore
 
 logger = logging.getLogger(__name__)
 
@@ -41,28 +42,40 @@ def _load_project_contract() -> str:
 
 
 class AIAgent:
-    """XFI CONNECT AI adapter with repository and module policy injection."""
+    """XFI CONNECT AI adapter using the encrypted application key store."""
 
     _PROVIDER_ALIASES = {"openrouter": "groq", "deepseek": "groq"}
 
-    def __init__(self, provider: str = "groq"):
+    def __init__(self, provider: str = "groq", key_store: AIKeyStore | None = None):
         self.provider = self._normalize_provider(provider)
         self.history: list[dict[str, str]] = []
         self.project_contract = _load_project_contract()
-        groq_key = getattr(config, "GROQ_API_KEY", "") or ""
-        self.groq_client = AsyncOpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1") if groq_key else None
-        grok_key = getattr(config, "GROK_API_KEY", getattr(config, "XAI_API_KEY", "")) or ""
-        self.grok_client = AsyncOpenAI(api_key=grok_key, base_url="https://api.x.ai/v1") if grok_key else None
+        self.key_store = key_store or AIKeyStore("data/ai_keys.enc")
+        self._clients: dict[str, AsyncOpenAI] = {}
+        self._refresh_client()
 
     @classmethod
     def _normalize_provider(cls, provider: str) -> str:
         return cls._PROVIDER_ALIASES.get((provider or "groq").strip().lower(), (provider or "groq").strip().lower())
 
+    def _refresh_client(self) -> None:
+        self._clients.clear()
+        groq_key = self.key_store.get("groq")
+        if groq_key:
+            self._clients["groq"] = AsyncOpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1")
+        grok_key = self.key_store.get("grok")
+        if grok_key:
+            self._clients["grok"] = AsyncOpenAI(api_key=grok_key, base_url="https://api.x.ai/v1")
+        openai_key = self.key_store.get("openai")
+        if openai_key:
+            self._clients["openai"] = AsyncOpenAI(api_key=openai_key)
+
     def set_provider(self, provider: str) -> None:
         normalized = self._normalize_provider(provider)
-        if normalized not in {"groq", "grok"}:
+        if normalized not in {"groq", "grok", "openai"}:
             raise ValueError(f"Неподдерживаемый AI-провайдер: {provider}")
         self.provider = normalized
+        self._refresh_client()
         self.reset()
 
     def reset(self) -> None:
@@ -70,24 +83,22 @@ class AIAgent:
 
     def _system_message(self, role: str, module_path: str | None = None) -> str:
         module_context = context_for(module_path or role)
-        return (
-            "Ты AI-инженер и ассистент администратора проекта XFI CONNECT.\n\n"
-            "Работай как инженер: анализируй причину, учитывай архитектуру и зависимости, "
-            "предлагай минимальное проверяемое изменение. Не выдумывай состояние системы, "
-            "результаты команд, CI, коммиты или выполненные действия.\n\n"
-            f"Текущий контекст: {role}\n\n"
-            f"Контекст модуля:\n{module_context}\n\n"
-            f"Общий контракт проекта:\n{self.project_contract}\n\n"
-            "Приоритет: безопасность и сохранение рабочего состояния > корректность > минимальность > скорость. "
-            "Для destructive/update/rollback действий сначала проверяй предусловия и требуй явного подтверждения."
-        )
+        return ("Ты AI-инженер и ассистент администратора проекта XFI CONNECT.\n\n"
+                "Работай как инженер: анализируй причину, учитывай архитектуру и зависимости, "
+                "предлагай минимальное проверяемое изменение. Не выдумывай состояние системы, "
+                "результаты команд, CI, коммиты или выполненные действия.\n\n"
+                f"Текущий контекст: {role}\n\nКонтекст модуля:\n{module_context}\n\n"
+                f"Общий контракт проекта:\n{self.project_contract}\n\n"
+                "Приоритет: безопасность и сохранение рабочего состояния > корректность > минимальность > скорость. "
+                "Для destructive/update/rollback действий сначала проверяй предусловия и требуй явного подтверждения.")
 
     async def _get_groq_model(self) -> str:
         configured = getattr(config, "GROQ_MODEL", "llama-3.3-70b-versatile")
-        if not self.groq_client:
+        client = self._clients.get("groq")
+        if not client:
             return configured
         try:
-            response = await self.groq_client.models.list()
+            response = await client.models.list()
             model_ids = {item.id for item in getattr(response, "data", []) if getattr(item, "id", None)}
             if configured in model_ids:
                 return configured
@@ -103,35 +114,35 @@ class AIAgent:
         prompt = (prompt or "").strip()
         if not prompt:
             return "❌ Пустой запрос."
+        self._refresh_client()
+        if self.provider == "openai":
+            return await self._call_openai(prompt, role=role, module_path=module_path)
         if self.provider == "grok":
             return await self._call_grok(prompt, role=role, module_path=module_path)
         return await self._call_groq(prompt, role=role, module_path=module_path)
 
+    async def _call_openai(self, prompt: str, *, role: str, module_path: str | None) -> str:
+        return await self._call_client("openai", prompt, getattr(config, "OPENAI_MODEL", "gpt-4.1-mini"), role=role, module_path=module_path)
+
     async def _call_groq(self, prompt: str, *, role: str, module_path: str | None) -> str:
-        if not self.groq_client:
-            return "❌ Ошибка: GROQ_API_KEY не указан в config.py"
-        messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_message(role, module_path)}, *self.history[-20:], {"role": "user", "content": prompt}]
-        try:
-            response = await self.groq_client.chat.completions.create(model=await self._get_groq_model(), messages=messages, temperature=0.7)
-            answer = response.choices[0].message.content or ""
-            self._remember(prompt, answer)
-            return answer or "❌ ИИ не вернул ответ."
-        except Exception as exc:
-            logger.exception("Groq error")
-            return f"❌ Ошибка Groq: {exc}"
+        return await self._call_client("groq", prompt, await self._get_groq_model(), role=role, module_path=module_path)
 
     async def _call_grok(self, prompt: str, *, role: str, module_path: str | None) -> str:
-        if not self.grok_client:
-            return "❌ Ошибка: GROK_API_KEY не указан в config.py"
+        return await self._call_client("grok", prompt, getattr(config, "GROK_MODEL", "grok-3-mini"), role=role, module_path=module_path)
+
+    async def _call_client(self, provider: str, prompt: str, model: str, *, role: str, module_path: str | None) -> str:
+        client = self._clients.get(provider)
+        if not client:
+            return f"❌ API key для {provider} не настроен. Используйте /ai_keys."
         messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_message(role, module_path)}, *self.history[-20:], {"role": "user", "content": prompt}]
         try:
-            response = await self.grok_client.chat.completions.create(model=getattr(config, "GROK_MODEL", "grok-3-mini"), messages=messages, temperature=0.7)
+            response = await client.chat.completions.create(model=model, messages=messages, temperature=0.7)
             answer = response.choices[0].message.content or ""
             self._remember(prompt, answer)
             return answer or "❌ ИИ не вернул ответ."
         except Exception as exc:
-            logger.exception("Grok error")
-            return f"❌ Ошибка Grok: {exc}"
+            logger.exception("AI provider error: %s", provider)
+            return f"❌ Ошибка AI-провайдера {provider}: {type(exc).__name__}"
 
     def _remember(self, prompt: str, answer: str) -> None:
         self.history.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
