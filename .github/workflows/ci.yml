@@ -15,11 +15,15 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt pytest
+        run: python -m pip install -r requirements.txt pytest pytest-asyncio
       - name: Prepare CI config
         run: cp config.py.example config.py
       - name: Compile Python sources
         run: python -m compileall -q . -x '(^|/)(\.git|\.snapshots|__pycache__|venv)(/|$)'
+      - name: Ruff lint
+        env:
+          PYTHONPATH: .
+        run: python -m ruff check .
       - name: Validate XFI updater imports
         run: |
           python - <<'PY'
@@ -31,7 +35,7 @@ jobs:
           assert xfi_health.SERVICE_NAME == "xfi-connect"
           print("XFI updater imports: OK")
           PY
-      - name: Run regression tests
+      - name: Run complete regression suite
         env:
           PYTHONPATH: .
-        run: pytest -q tests/test_xfi_update.py tests/test_xfi_health.py tests/test_ai_agent.py
+        run: pytest -q
