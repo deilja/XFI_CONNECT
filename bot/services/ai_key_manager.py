@@ -3,14 +3,15 @@ from __future__ import annotations
 
 from bot.services.ai_key_store import AIKeyStore
 from bot.services.ai_key_validation import AIKeyValidator
+from bot.services.ai_provider_validators import build_validator
 
 SUPPORTED_PROVIDERS = ("groq", "grok", "openai")
 
 
 class AIKeyManager:
-    def __init__(self, store: AIKeyStore, validator: AIKeyValidator):
+    def __init__(self, store: AIKeyStore, validator: AIKeyValidator | None = None):
         self.store = store
-        self.validator = validator
+        self.validator = validator or build_validator()
 
     def providers(self) -> tuple[str, ...]:
         return SUPPORTED_PROVIDERS
