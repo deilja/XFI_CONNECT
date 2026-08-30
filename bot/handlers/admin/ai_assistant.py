@@ -1,4 +1,9 @@
-"""AI-ассистент для админ-панели XFI CONNECT."""
+"""AI-ассистент админ-панели XFI CONNECT.
+
+AI contract: this module is the Telegram UI only. Business logic belongs in
+services; privileged actions must keep existing admin authorization and must
+not be executed merely because the model suggested them.
+"""
 from __future__ import annotations
 
 import logging
@@ -160,7 +165,10 @@ async def process_ai_message(message: Message, state: FSMContext):
     agent = _get_agent(message.from_user.id)
     wait_msg = await message.answer("⏳ Думаю...")
     try:
-        answer = await agent.chat(message.text)
+        answer = await agent.chat(
+            message.text,
+            role="bot/handlers/admin/ai_assistant.py — Telegram admin AI UI; do not execute privileged actions without explicit existing authorization/workflow",
+        )
     except Exception:
         logger.exception("AI error")
         answer = "❌ Ошибка AI. Подробности записаны в журнал."
