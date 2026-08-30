@@ -11,7 +11,6 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from config import ADMIN_IDS
 from bot.services.ai_key_manager import AIKeyManager
 from bot.services.ai_key_store import AIKeyStore
-from bot.services.ai_key_validation import AIKeyValidator
 
 logger = logging.getLogger(__name__)
 router = Router(name="ai_keys")
@@ -26,8 +25,7 @@ def _admin(uid: int) -> bool:
 
 
 def _manager() -> AIKeyManager:
-    # The deployment must provide XFI_AI_KEYSTORE_MASTER_KEY.
-    return AIKeyManager(AIKeyStore("data/ai_keys.enc"), AIKeyValidator())
+    return AIKeyManager(AIKeyStore("data/ai_keys.enc"))
 
 
 def _menu() -> InlineKeyboardMarkup:
@@ -64,15 +62,12 @@ async def receive_key(message: Message, state: FSMContext):
     data = await state.get_data()
     provider = data.get("provider")
     key = message.text.strip()
-    # Delete the Telegram message containing the secret as soon as possible.
     try:
         await message.delete()
     except Exception:
         logger.warning("Could not delete AI key message")
     try:
-        # Validators are registered by deployment integration; absence is fail-closed.
-        manager = _manager()
-        ok = await manager.validate_and_set(provider, key)
+        ok = await _manager().validate_and_set(provider, key)
         await message.answer("✅ Ключ проверен и сохранён." if ok else "❌ Ключ не прошёл проверку и не сохранён.")
     except Exception:
         logger.exception("AI key setup failed")
