@@ -10,9 +10,11 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
+from config import ADMIN_IDS
 from bot.utils.admin import is_admin
 from bot.utils.text import safe_edit_or_send
 from bot.services.code_agent import CodeAgent
+from bot.services.ai_supervisor import start_monitor, stop_monitor, monitor_status
 from bot.keyboards.agent_kb import (
     agent_home_kb,
     agent_stats_kb,
@@ -47,7 +49,8 @@ def _agent(admin_id: int) -> CodeAgent:
 INTRO = (
     "🛠 <b>Local YaAdmin / DevAgent</b>\n\n"
     "Жми кнопки или пиши свободный текст.\n"
-    "Свободный чат — кнопка «💬 Свободный чат»."
+    "Свободный чат — кнопка «💬 Свободный чат».\n\n"
+    "🤖 AI Supervisor автоматически мониторит проект, runtime, безопасность и предлагает улучшения."
 )
 
 
@@ -69,7 +72,6 @@ def _fmt(result: str) -> str:
         return (result or "")[:4000]
 
 
-# --- fixed actions: tool_name, args ---
 ACTIONS = {
     "keys_stats": ("get_keys_stats", {}),
     "users_stats": ("get_users_stats", {}),
@@ -88,7 +90,6 @@ ACTIONS = {
     "logs": ("read_bot_logs", {"lines": 40}),
 }
 
-# ask modes: prompt text + how to build tool call from user message
 ASK = {
     "key_id": ("Введи key_id (число):", "get_key", lambda t: {"key_id": int(t.strip())}),
     "user_keys": ("Введи telegram_id:", "list_user_keys", lambda t: {"telegram_id": int(t.strip())}),
@@ -115,6 +116,7 @@ async def start_agent(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return await callback.answer("⛔", show_alert=True)
     await callback.answer()
+    start_monitor(callback.message.bot, list(ADMIN_IDS))
     _agent(callback.from_user.id)
     await state.set_state(DevAgentStates.chatting)
     await safe_edit_or_send(callback.message, INTRO, reply_markup=agent_home_kb())
@@ -124,6 +126,7 @@ async def start_agent(callback: CallbackQuery, state: FSMContext):
 async def ag_home(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
+    start_monitor(callback.message.bot, list(ADMIN_IDS))
     await state.set_state(DevAgentStates.chatting)
     await callback.answer()
     await safe_edit_or_send(callback.message, INTRO, reply_markup=agent_home_kb())
@@ -133,10 +136,15 @@ async def ag_home(callback: CallbackQuery, state: FSMContext):
 async def ag_chat_mode(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
+    start_monitor(callback.message.bot, list(ADMIN_IDS))
     await state.set_state(DevAgentStates.chatting)
     await callback.answer()
     await callback.message.answer(
-        "💬 Пиши задачу текстом (Groq).\nВыход из чата — кнопка «В меню агента».",
+        "💬 Пиши задачу обычным текстом.\n"
+        "Например: «проверь весь проект и предложи улучшения», «исправь ошибку оплаты», "
+        "«усиль безопасность админки».\n\n"
+        "Мониторинг работает автоматически. Выход — кнопка «В меню агента».\n"
+        "Управление мониторингом: «мониторинг статус», «мониторинг стоп». ",
         reply_markup=agent_back_kb(),
     )
 
@@ -173,7 +181,6 @@ async def ag_action(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     key = callback.data.split(":", 2)[-1]
 
-    # code list dirs via agent tools
     if key == "list_handlers":
         res = await _run_tool("list_files", {"rel_dir": "bot/handlers"})
         await callback.message.answer(f"<b>bot/handlers</b>\n<pre>{_fmt(res)}</pre>", parse_mode="HTML", reply_markup=agent_back_kb())
@@ -240,7 +247,6 @@ async def ag_input(message: Message, state: FSMContext):
     await message.answer(f"<pre>{_fmt(res)}</pre>", parse_mode="HTML", reply_markup=agent_back_kb())
 
 
-# report / rollback / reset / exit — как раньше
 @router.callback_query(F.data == "code:report")
 async def cb_report(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -282,18 +288,39 @@ async def cb_exit(callback: CallbackQuery, state: FSMContext):
 
 @router.message(DevAgentStates.chatting)
 async def on_chat(message: Message, state: FSMContext):
-    """Свободный текст → Groq."""
+    """Обычный текст администратора → единый AI Supervisor/DevAgent."""
     if not is_admin(message.from_user.id) or not message.text:
         return
-    if message.text.strip().lower() in {"выход", "exit", "/admin", "меню"}:
+    text = message.text.strip()
+    lower = text.lower()
+
+    if lower in {"выход", "exit", "/admin", "меню"}:
         await state.clear()
         await message.answer("Вышел. /code или админка.", reply_markup=agent_home_kb())
         return
 
+    if "мониторинг стоп" in lower or "мониторинг выключи" in lower:
+        stop_monitor()
+        await message.answer("🤖 AI Supervisor: мониторинг остановлен.", reply_markup=agent_home_kb())
+        return
+
+    if "мониторинг статус" in lower or lower == "мониторинг":
+        status = monitor_status()
+        await message.answer(
+            "🤖 <b>AI Supervisor</b>\n"
+            f"Состояние: {'работает' if status['running'] else 'остановлен'}\n"
+            f"Интервал: {status['interval_min']} мин\n"
+            f"Последний отчёт: {status['last_digest'] or 'ещё нет'}",
+            parse_mode="HTML",
+            reply_markup=agent_home_kb(),
+        )
+        return
+
+    start_monitor(message.bot, list(ADMIN_IDS))
     agent = _agent(message.from_user.id)
-    wait = await message.answer("⏳ Groq…")
+    wait = await message.answer("⏳ AI Supervisor…")
     try:
-        result = await agent.chat(message.text)
+        result = await agent.chat(text)
     except Exception as e:
         logger.exception("chat")
         result = f"❌ {e}"
