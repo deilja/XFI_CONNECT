@@ -1,18 +1,17 @@
 """Application-level bridge: supervisor -> ChangeSet -> transaction -> verification."""
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from bot.services.ai_agent import AIAgent
 from bot.services.ai_autopilot import AIAutopilot, ChangePlan
-from bot.services.ai_changeset import ChangeSetError, apply, begin, commit, rollback
+from bot.services.ai_changeset import apply, begin, commit, rollback
 from bot.services.ai_changeset_parser import parse_changeset
 from bot.services.ai_executor import ExecutionResult
 
 logger = logging.getLogger(__name__)
-
 Verifier = Callable[[ChangePlan], Awaitable[bool]]
 
 
@@ -44,10 +43,10 @@ class AutopilotEngine:
             verified = await self._verify(plan)
             if not verified:
                 rollback(tx)
-                return ExecutionResult("changeset", False, "Health/test verification failed; rollback completed")
+                return ExecutionResult("changeset", False, "Verification failed; complete rollback finished")
             commit(tx)
             self.autopilot.pending.pop(token, None)
-            return ExecutionResult("changeset", True, "Changes applied and verification passed")
+            return ExecutionResult("changeset", True, "Changes applied and all verification checks passed")
         except Exception:
             logger.exception("AI ChangeSet failed; rolling back")
             try:
@@ -57,7 +56,9 @@ class AutopilotEngine:
             raise
 
     async def _verify(self, plan: ChangePlan) -> bool:
-        if self.verifier is None:
-            # Fail closed: no verification callback means no commit.
-            return False
-        return bool(await self.verifier(plan))
+        if self.verifier is not None:
+            return bool(await self.verifier(plan))
+        # Default to the application-owned production verifier.
+        from bot.services.ai_runtime_verifier import build_production_verifier
+        verifier, _pipeline = await build_production_verifier(self.project_root)
+        return bool(await verifier(plan))
