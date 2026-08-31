@@ -18,6 +18,8 @@ from bot.services import cryptobot_ui as _cryptobot_ui  # noqa: F401
 from bot.handlers.user import router as user_router
 from bot.handlers.admin import admin_router
 from bot.handlers import ai, admin_ai
+from bot.services.ai_admin_telegram import router as ai_admin_supervisor_router
+from bot.services.ai_admin_workflow_telegram import router as ai_admin_workflow_router
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [%(name)s] - %(message)s", handlers=[logging.StreamHandler(), RotatingFileHandler("logs/bot.log", maxBytes=1024 * 1024, backupCount=3, encoding="utf-8")])
@@ -81,6 +83,8 @@ async def main():
     dp.message.outer_middleware(middleware)
     dp.callback_query.outer_middleware(middleware)
     dp.include_router(admin_ai.router)
+    dp.include_router(ai_admin_supervisor_router)
+    dp.include_router(ai_admin_workflow_router)
     dp.include_router(admin_router)
     dp.include_router(user_router)
     dp.include_router(ai.router)
