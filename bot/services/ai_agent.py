@@ -37,7 +37,9 @@ def _load_project_contract() -> str:
 
 
 class AIAgent:
-    """Unified AI adapter. Provider/model selection comes from monitored inventory."""
+    """Unified AI adapter with monitored model selection and bounded failover."""
+
+    MAX_ATTEMPTS = 3
 
     def __init__(self, provider: str | None = None, key_store: AIKeyStore | None = None, inventory=None):
         self.provider = (provider or "").strip().lower() or None
@@ -77,38 +79,53 @@ class AIAgent:
                 f"Текущий контекст: {role}\n\nКонтекст модуля:\n{context_for(module_path or role)}\n\n"
                 f"Общий контракт проекта:\n{self.project_contract}")
 
-    def _choice(self, task_type: str) -> tuple[str, str] | None:
-        if self.selector is not None:
-            choice = self.selector.choose(task_type, preferred_provider=self.provider)
-            if choice:
-                return choice.provider, choice.model
-            return None
-        if self.provider and self.provider in self._clients:
-            defaults = {"groq": getattr(config, "GROQ_MODEL", ""), "grok": getattr(config, "GROK_MODEL", ""), "openai": getattr(config, "OPENAI_MODEL", "")}
-            return self.provider, defaults[self.provider]
-        return None
+    def _candidate_choices(self, task_type: str) -> list[tuple[str, str]]:
+        if self.selector is None:
+            if self.provider and self.provider in self._clients:
+                defaults = {"groq": getattr(config, "GROQ_MODEL", ""), "grok": getattr(config, "GROK_MODEL", ""), "openai": getattr(config, "OPENAI_MODEL", "")}
+                return [(self.provider, defaults[self.provider])]
+            return []
+        available = self.inventory.available()
+        providers = list(available)
+        if self.provider in available:
+            providers.remove(self.provider)
+            providers.insert(0, self.provider)
+        choices: list[tuple[str, str]] = []
+        for provider in providers:
+            selected = self.selector.choose(task_type, preferred_provider=provider)
+            if selected:
+                choices.append((selected.provider, selected.model))
+        return choices
 
     async def chat(self, prompt: str, *, role: str = "admin AI assistant", module_path: str | None = None, task_type: str = "analysis") -> str:
         prompt = (prompt or "").strip()
         if not prompt:
             return "❌ Пустой запрос."
         self._refresh_client()
-        choice = self._choice(task_type)
-        if not choice:
+        choices = self._candidate_choices(task_type)[: self.MAX_ATTEMPTS]
+        if not choices:
             return "❌ Нет доступного AI-провайдера или модели. Настройте рабочий ключ через /ai_keys."
-        provider, model = choice
-        client = self._clients.get(provider)
-        if not client or not model:
-            return "❌ Выбранный AI-провайдер недоступен."
         messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_message(role, module_path)}, *self.history[-20:], {"role": "user", "content": prompt}]
-        try:
-            response = await client.chat.completions.create(model=model, messages=messages, temperature=0.7)
-            answer = response.choices[0].message.content or ""
-            self._remember(prompt, answer)
-            return answer or "❌ ИИ не вернул ответ."
-        except Exception as exc:
-            logger.warning("AI request failed provider=%s error=%s", provider, type(exc).__name__)
-            return f"❌ Ошибка AI-провайдера {provider}: {type(exc).__name__}"
+        failures: list[str] = []
+        for provider, model in choices:
+            client = self._clients.get(provider)
+            if not client or not model:
+                failures.append(f"{provider}:unavailable")
+                continue
+            try:
+                response = await client.chat.completions.create(model=model, messages=messages, temperature=0.7)
+                answer = response.choices[0].message.content or ""
+                if answer:
+                    self._remember(prompt, answer)
+                    return answer
+                failures.append(f"{provider}:empty_response")
+            except Exception as exc:
+                # Do not echo provider error details or key material to the admin.
+                logger.warning("AI request failed provider=%s error=%s", provider, type(exc).__name__)
+                failures.append(f"{provider}:{type(exc).__name__}")
+                continue
+        logger.warning("All AI candidates failed: %s", ",".join(failures))
+        return "❌ Все доступные AI-провайдеры не смогли обработать запрос."
 
     def _remember(self, prompt: str, answer: str) -> None:
         self.history.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
