@@ -18,8 +18,6 @@ from bot.services import cryptobot_ui as _cryptobot_ui  # noqa: F401
 from bot.handlers.user import router as user_router
 from bot.handlers.admin import admin_router
 from bot.handlers import ai, admin_ai
-from bot.services.ai_admin_telegram import router as ai_admin_supervisor_router
-from bot.services.ai_admin_workflow_telegram import router as ai_admin_workflow_router
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [%(name)s] - %(message)s", handlers=[logging.StreamHandler(), RotatingFileHandler("logs/bot.log", maxBytes=1024 * 1024, backupCount=3, encoding="utf-8")])
@@ -83,8 +81,6 @@ async def main():
     dp.message.outer_middleware(middleware)
     dp.callback_query.outer_middleware(middleware)
     dp.include_router(admin_ai.router)
-    dp.include_router(ai_admin_supervisor_router)
-    dp.include_router(ai_admin_workflow_router)
     dp.include_router(admin_router)
     dp.include_router(user_router)
     dp.include_router(ai.router)
@@ -117,6 +113,8 @@ async def main():
     from bot.services.ai_key_store import AIKeyStore
     from bot.services.ai_key_manager import SUPPORTED_PROVIDERS
     from bot.services.ai_provider_checks import check_groq, check_grok, check_openai
+    from bot.services.ai_runtime_inventory import MonitoredModelInventory
+    from bot.services.ai_control_center import AIControlCenter
 
     key_store = AIKeyStore("data/ai_keys.enc")
     checks = {"groq": check_groq, "grok": check_grok, "openai": check_openai}
@@ -128,6 +126,14 @@ async def main():
         return await checks[provider](key)
 
     monitor = AIKeyHealthMonitor(key_store, SUPPORTED_PROVIDERS, provider_check)
+    await monitor.check_all()
+    inventory = MonitoredModelInventory(monitor)
+    control_center = AIControlCenter(".", inventory, key_store=key_store)
+    ai_supervisor_router, ai_workflow_router = control_center.configure_telegram()
+    dp.include_router(ai_supervisor_router)
+    dp.include_router(ai_workflow_router)
+    bot.ai_control_center = control_center
+
     monitor_loop = AIKeyMonitorLoop(monitor, interval=900)
     bot.ai_key_monitor_loop = monitor_loop
     monitor_loop.start()
