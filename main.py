@@ -118,6 +118,7 @@ async def main():
     from bot.services.ai_provider_checks import check_groq, check_grok, check_openai
     from bot.services.ai_runtime_inventory import MonitoredModelInventory
     from bot.services.ai_control_center import AIControlCenter
+    from bot.services.ai_admin_ids import get_ai_admin_ids
 
     key_store = AIKeyStore("data/ai_keys.enc")
     checks = {"groq": check_groq, "grok": check_grok, "openai": check_openai}
@@ -134,7 +135,10 @@ async def main():
     monitor = AIKeyHealthMonitor(key_store, SUPPORTED_PROVIDERS, provider_check)
     await monitor.check_all()
     inventory = MonitoredModelInventory(monitor)
-    control_center = AIControlCenter(".", inventory, key_store=key_store, bot=bot, admin_ids=[])
+    admin_ids = get_ai_admin_ids()
+    if not admin_ids:
+        logger.warning("AI audit notifications disabled: admin IDs are not configured")
+    control_center = AIControlCenter(".", inventory, key_store=key_store, bot=bot, admin_ids=admin_ids)
     ai_supervisor_router, ai_workflow_router, ai_audit_router = control_center.configure_telegram()
     dp.include_router(ai_supervisor_router)
     dp.include_router(ai_workflow_router)
