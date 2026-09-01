@@ -62,6 +62,9 @@ async def on_shutdown(bot: Bot):
     monitor_loop = getattr(bot, "ai_key_monitor_loop", None)
     if monitor_loop is not None:
         await monitor_loop.stop()
+    control_center = getattr(bot, "ai_control_center", None)
+    if control_center is not None:
+        await control_center.stop()
     webhook_server = getattr(bot, "custom_payment_webhook_server", None)
     if webhook_server is not None:
         try:
@@ -123,26 +126,32 @@ async def main():
         key = key_store.get(provider)
         if not key:
             return False
-        return await checks[provider](key)
+        checker = checks.get(provider)
+        if checker is None:
+            return False
+        return await checker(key)
 
     monitor = AIKeyHealthMonitor(key_store, SUPPORTED_PROVIDERS, provider_check)
     await monitor.check_all()
     inventory = MonitoredModelInventory(monitor)
-    control_center = AIControlCenter(".", inventory, key_store=key_store)
-    ai_supervisor_router, ai_workflow_router = control_center.configure_telegram()
+    control_center = AIControlCenter(".", inventory, key_store=key_store, bot=bot, admin_ids=[])
+    ai_supervisor_router, ai_workflow_router, ai_audit_router = control_center.configure_telegram()
     dp.include_router(ai_supervisor_router)
     dp.include_router(ai_workflow_router)
+    dp.include_router(ai_audit_router)
     bot.ai_control_center = control_center
 
     monitor_loop = AIKeyMonitorLoop(monitor, interval=900)
     bot.ai_key_monitor_loop = monitor_loop
     monitor_loop.start()
+    control_center.start_audit()
 
     background_tasks = [daily_task, traffic_task, payment_task]
     try:
         await dp.start_polling(bot)
     finally:
         await monitor_loop.stop()
+        await control_center.stop()
         for task in background_tasks:
             task.cancel()
         await asyncio.gather(*background_tasks, return_exceptions=True)
