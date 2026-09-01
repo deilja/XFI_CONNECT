@@ -9,6 +9,7 @@ from pathlib import Path
 
 from bot.services.ai_admin_pipeline import AIAdminPipeline
 from bot.services.ai_admin_supervisor import AIAdminSupervisor
+from bot.services.ai_admin_workflow import AIAdminWorkflow
 from bot.services.ai_agent import AIAgent
 from bot.services.ai_changeset_approval import ChangeSetApprovalStore
 from bot.services.ai_changeset_bridge import ChangeSetBridge
@@ -29,7 +30,8 @@ class AIControlCenter:
         self.bridge = ChangeSetBridge(root)
         self.approvals = ChangeSetApprovalStore()
         self.proposal_service = AIProposalService(self.agent, str(root))
-        self.pipeline = AIAdminPipeline(self.proposal_service, AIAdminWorkflow(self.supervisor, self.bridge, self.approvals))
+        self.workflow = AIAdminWorkflow(self.supervisor, self.bridge, self.approvals)
+        self.pipeline = AIAdminPipeline(self.proposal_service, self.workflow)
 
     def configure_telegram(self):
         from bot.services import ai_admin_telegram, ai_admin_workflow_telegram
