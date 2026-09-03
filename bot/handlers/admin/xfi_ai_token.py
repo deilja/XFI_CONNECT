@@ -1,22 +1,13 @@
 """Admin command for configuring the XFI AI Gateway token."""
 
-import os
-from pathlib import Path
-
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from bot.services.xfi_ai_service import save_gateway_token, verify_gateway_token
 from bot.utils.admin import is_admin
 
 router = Router()
-TOKEN_FILE = Path(os.getenv("XFI_AI_TOKEN_FILE", "data/xfi_ai_gateway_token"))
-
-
-def _save_token(token: str) -> None:
-    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(token + "\n", encoding="utf-8")
-    os.chmod(TOKEN_FILE, 0o600)
 
 
 @router.message(Command("ai_token"))
@@ -38,8 +29,16 @@ async def set_ai_token(message: Message) -> None:
         await message.answer("Некорректный XFI AI токен.")
         return
 
-    _save_token(token)
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    if not await verify_gateway_token(token):
+        await message.answer(
+            "XFI AI токен не прошёл проверку Gateway.\n"
+            "Проверьте токен и доступность XFI AI."
+        )
+        return
+
+    save_gateway_token(token)
     await message.answer(
-        "XFI AI токен сохранён в защищённом файле.\n"
+        "XFI AI токен проверен и сохранён.\n"
         "Новые запросы /ai будут использовать этот токен."
     )
