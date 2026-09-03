@@ -39,6 +39,42 @@ def get_gateway_token() -> str:
         return os.getenv("XFI_AI_API_KEY", "").strip()
 
 
+async def verify_gateway_token(token: str) -> bool:
+    """Verify a token against the Gateway without exposing its value in logs."""
+    token = token.strip()
+    if not token or not token.startswith("xfi_"):
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=XFI_AI_TIMEOUT) as client:
+            response = await client.get(
+                f"{XFI_AI_BASE_URL}/v1/models",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        return response.status_code == 200
+    except httpx.HTTPError as exc:
+        logger.warning("XFI AI Gateway token verification failed: %s", exc)
+        return False
+
+
+def save_gateway_token(token: str) -> None:
+    """Atomically save the Gateway token with owner-only permissions."""
+    token = token.strip()
+    if not token:
+        raise ValueError("token is empty")
+    XFI_AI_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = XFI_AI_TOKEN_FILE.with_name(f".{XFI_AI_TOKEN_FILE.name}.tmp")
+    try:
+        tmp_file.write_text(token + "\n", encoding="utf-8")
+        os.chmod(tmp_file, 0o600)
+        os.replace(tmp_file, XFI_AI_TOKEN_FILE)
+        os.chmod(XFI_AI_TOKEN_FILE, 0o600)
+    finally:
+        try:
+            tmp_file.unlink()
+        except FileNotFoundError:
+            pass
+
+
 async def ask_xfi_ai(user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> str:
     """Send a chat request through the XFI AI Gateway."""
     token = get_gateway_token()
