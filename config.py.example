@@ -11,6 +11,13 @@ TELEGRAM_API_URL = "https://api.telegram.org"
 # XFI CONNECT updater is repository-bound; origin must point to this repository.
 GITHUB_REPO_URL = "https://github.com/deilja/XFI_CONNECT.git"
 
+# XFI AI Gateway. Provider API keys are stored and managed by XFI AI,
+# not inside XFI CONNECT.
+XFI_AI_BASE_URL = os.getenv("XFI_AI_BASE_URL", "http://127.0.0.1:8091")
+XFI_AI_API_KEY = os.getenv("XFI_AI_API_KEY", "")
+XFI_AI_MODEL = os.getenv("XFI_AI_MODEL", "")
+XFI_AI_TIMEOUT = float(os.getenv("XFI_AI_TIMEOUT", "45"))
+
 DEFAULT_LIMIT_IP = 1
 DEFAULT_TOTAL_GB = 1024 * 1024 * 1024 * 1024
 
