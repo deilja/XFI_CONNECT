@@ -38,7 +38,14 @@ async def set_ai_token(message: Message) -> None:
         return
 
     save_gateway_token(token)
+    try:
+        await message.delete()
+    except Exception:
+        # Deleting the command is best-effort: some chats/bots may not permit it.
+        pass
+
     await message.answer(
         "XFI AI токен проверен и сохранён.\n"
+        "Команда с токеном удалена из чата, если Telegram разрешил удаление.\n"
         "Новые запросы /ai будут использовать этот токен."
     )
