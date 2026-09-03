@@ -22,16 +22,16 @@ v2RayTun, Amnezia, Incy и другими клиентами VPN.
 """.strip()
 
 
-class XFI AIError(RuntimeError):
+class XFIAIError(RuntimeError):
     """Gateway request failed or returned an invalid response."""
 
 
 async def ask_xfi_ai(user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> str:
     """Send a chat request through the XFI AI Gateway."""
     if not XFI_AI_API_KEY:
-        raise XFI AIError("XFI_AI_API_KEY is not configured")
+        raise XFIAIError("XFI_AI_API_KEY is not configured")
     if not user_prompt or len(user_prompt) > 12000:
-        raise XFI AIError("Prompt is empty or too large")
+        raise XFIAIError("Prompt is empty or too large")
 
     body = {
         "messages": [
@@ -56,14 +56,14 @@ async def ask_xfi_ai(user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> st
         data = response.json()
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("XFI AI Gateway request failed: %s", exc)
-        raise XFI AIError("XFI AI Gateway request failed") from exc
+        raise XFIAIError("XFI AI Gateway request failed") from exc
 
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         logger.warning("XFI AI Gateway returned unexpected response")
-        raise XFI AIError("Invalid XFI AI Gateway response") from exc
+        raise XFIAIError("Invalid XFI AI Gateway response") from exc
 
     if not isinstance(content, str) or not content.strip():
-        raise XFI AIError("Empty XFI AI response")
+        raise XFIAIError("Empty XFI AI response")
     return content.strip()
