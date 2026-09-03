@@ -2,13 +2,13 @@ import importlib
 
 import pytest
 
+import bot.services.xfi_ai_service as service
+
 
 @pytest.mark.asyncio
 async def test_xfi_ai_gateway_client(monkeypatch):
     monkeypatch.setenv("XFI_AI_API_KEY", "xfi_test_key")
     monkeypatch.setenv("XFI_AI_BASE_URL", "https://ai.example.test")
-
-    import bot.services.xfi_ai_service as service
 
     importlib.reload(service)
     captured = {}
@@ -47,8 +47,6 @@ async def test_xfi_ai_gateway_client(monkeypatch):
 @pytest.mark.asyncio
 async def test_xfi_ai_gateway_requires_key(monkeypatch):
     monkeypatch.delenv("XFI_AI_API_KEY", raising=False)
-
-    import bot.services.xfi_ai_service as service
 
     importlib.reload(service)
     with pytest.raises(service.XFIAIError):
