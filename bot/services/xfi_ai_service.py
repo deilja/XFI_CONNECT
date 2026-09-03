@@ -2,14 +2,15 @@
 
 import logging
 import os
+from pathlib import Path
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 XFI_AI_BASE_URL = os.getenv("XFI_AI_BASE_URL", "http://127.0.0.1:8091").rstrip("/")
-XFI_AI_API_KEY = os.getenv("XFI_AI_API_KEY", "").strip()
 XFI_AI_MODEL = os.getenv("XFI_AI_MODEL", "").strip()
+XFI_AI_TOKEN_FILE = Path(os.getenv("XFI_AI_TOKEN_FILE", "data/xfi_ai_gateway_token"))
 try:
     XFI_AI_TIMEOUT = float(os.getenv("XFI_AI_TIMEOUT", "45"))
 except ValueError:
@@ -30,10 +31,19 @@ class XFIAIError(RuntimeError):
     """Gateway request failed or returned an invalid response."""
 
 
+def get_gateway_token() -> str:
+    """Read the Gateway token from the local protected file."""
+    try:
+        return XFI_AI_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return os.getenv("XFI_AI_API_KEY", "").strip()
+
+
 async def ask_xfi_ai(user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> str:
     """Send a chat request through the XFI AI Gateway."""
-    if not XFI_AI_API_KEY:
-        raise XFIAIError("XFI_AI_API_KEY is not configured")
+    token = get_gateway_token()
+    if not token:
+        raise XFIAIError("XFI AI Gateway token is not configured")
     if not user_prompt or len(user_prompt) > 12000:
         raise XFIAIError("Prompt is empty or too large")
 
@@ -48,7 +58,7 @@ async def ask_xfi_ai(user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> st
     if XFI_AI_MODEL:
         body["model"] = XFI_AI_MODEL
 
-    headers = {"Authorization": f"Bearer {XFI_AI_API_KEY}"}
+    headers = {"Authorization": f"Bearer {token}"}
     try:
         async with httpx.AsyncClient(timeout=XFI_AI_TIMEOUT) as client:
             response = await client.post(
