@@ -10,7 +10,11 @@ logger = logging.getLogger(__name__)
 XFI_AI_BASE_URL = os.getenv("XFI_AI_BASE_URL", "http://127.0.0.1:8091").rstrip("/")
 XFI_AI_API_KEY = os.getenv("XFI_AI_API_KEY", "").strip()
 XFI_AI_MODEL = os.getenv("XFI_AI_MODEL", "").strip()
-XFI_AI_TIMEOUT = float(os.getenv("XFI_AI_TIMEOUT", "45"))
+try:
+    XFI_AI_TIMEOUT = float(os.getenv("XFI_AI_TIMEOUT", "45"))
+except ValueError:
+    XFI_AI_TIMEOUT = 45.0
+XFI_AI_TIMEOUT = min(max(XFI_AI_TIMEOUT, 5.0), 120.0)
 
 SYSTEM_PROMPT = """
 Ты — ИИ-ассистент технической поддержки VPN-сервиса XFI Connect.
