@@ -27,6 +27,7 @@ from bot.handlers.admin.customization_reset import router as customization_reset
 from bot.handlers.admin.code_editor import router as code_editor_router
 from bot.handlers.admin.dev_agent import router as dev_agent_router
 from bot.handlers.admin.yaa_local import router as yaa_local_router
+from bot.handlers.admin.xfi_ai_token import router as xfi_ai_token_router
 
 admin_router = Router()
 
@@ -46,6 +47,7 @@ async def update_callback_disabled(callback: CallbackQuery):
 
 
 admin_router.include_router(update_disabled_router)
+admin_router.include_router(xfi_ai_token_router)
 admin_router.include_router(main_router)
 admin_router.include_router(message_editor_router)
 admin_router.include_router(servers_router)
