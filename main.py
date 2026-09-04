@@ -6,18 +6,21 @@ import os
 from logging.handlers import RotatingFileHandler
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ErrorEvent
 
-from config import BOT_TOKEN
-from database.migrations import run_migrations
-from bot.services.vpn_api import close_all_clients
-from bot.services.scheduler import run_daily_tasks, run_traffic_sync_scheduler
-from bot.services.payment_auto_check import run_payment_auto_check_scheduler
+from bot.handlers import admin_ai, ai
+from bot.handlers.admin import admin_router
+from bot.handlers.user import router as user_router
 from bot.services import cryptobot_provider as _cryptobot_provider  # noqa: F401
 from bot.services import cryptobot_ui as _cryptobot_ui  # noqa: F401
-from bot.handlers.user import router as user_router
-from bot.handlers.admin import admin_router
-from bot.handlers import ai, admin_ai
+from bot.services.payment_auto_check import run_payment_auto_check_scheduler
+from bot.services.scheduler import run_daily_tasks, run_traffic_sync_scheduler
+from bot.services.vpn_api import close_all_clients
+from bot.utils.callbacks import is_expired_callback_error
+from config import BOT_TOKEN
+from database.migrations import run_migrations
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [%(name)s] - %(message)s", handlers=[logging.StreamHandler(), RotatingFileHandler("logs/bot.log", maxBytes=1024 * 1024, backupCount=3, encoding="utf-8")])
@@ -78,10 +81,11 @@ async def on_shutdown(bot: Bot):
 
 
 async def main():
+    from bot.middlewares.bot_blocked import BotBlockedResetMiddleware
     from bot.middlewares.parse_mode_fallback import SafeParseSession
+
     bot = Bot(token=BOT_TOKEN, session=SafeParseSession())
     dp = Dispatcher(storage=MemoryStorage())
-    from bot.middlewares.bot_blocked import BotBlockedResetMiddleware
     middleware = BotBlockedResetMiddleware()
     dp.message.outer_middleware(middleware)
     dp.callback_query.outer_middleware(middleware)
@@ -89,9 +93,6 @@ async def main():
     dp.include_router(admin_router)
     dp.include_router(user_router)
     dp.include_router(ai.router)
-    from aiogram.exceptions import TelegramNetworkError
-    from aiogram.types import ErrorEvent
-    from bot.utils.callbacks import is_expired_callback_error
 
     @dp.errors()
     async def global_error_handler(event: ErrorEvent):
@@ -113,14 +114,14 @@ async def main():
     traffic_task = asyncio.create_task(run_traffic_sync_scheduler(bot))
     payment_task = asyncio.create_task(run_payment_auto_check_scheduler(bot))
 
+    from bot.services.ai_admin_ids import get_ai_admin_ids
+    from bot.services.ai_control_center import AIControlCenter
+    from bot.services.ai_key_manager import SUPPORTED_PROVIDERS
     from bot.services.ai_key_monitor import AIKeyHealthMonitor
     from bot.services.ai_key_monitor_loop import AIKeyMonitorLoop
     from bot.services.ai_key_store import AIKeyStore
-    from bot.services.ai_key_manager import SUPPORTED_PROVIDERS
-    from bot.services.ai_provider_checks import check_groq, check_grok, check_openai
+    from bot.services.ai_provider_checks import check_grok, check_groq, check_openai
     from bot.services.ai_runtime_inventory import MonitoredModelInventory
-    from bot.services.ai_control_center import AIControlCenter
-    from bot.services.ai_admin_ids import get_ai_admin_ids
 
     key_store = AIKeyStore("data/ai_keys.enc")
     checks = {"groq": check_groq, "grok": check_grok, "openai": check_openai}
