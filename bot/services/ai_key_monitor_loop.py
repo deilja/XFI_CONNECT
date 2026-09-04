@@ -28,6 +28,7 @@ class AIKeyMonitorLoop:
 
     async def run_once(self) -> dict[str, ProviderHealth]:
         results = await self.monitor.check_all()
+        notified_transition = False
         for provider, status in results.items():
             models = tuple(getattr(status, "models", ()) or ())
             current = (status.healthy, models)
@@ -36,12 +37,13 @@ class AIKeyMonitorLoop:
                 if previous[0] != status.healthy:
                     event = "восстановлен" if status.healthy else "стал недоступен"
                     await self.notify(f"AI: провайдер {provider} {event}.")
+                    notified_transition = True
                 elif previous[1] != models:
                     await self.notify(f"AI: изменился список моделей провайдера {provider}.")
             self._previous[provider] = current
         if not results:
             return results
-        if not any(status.enabled for status in results.values()) and self.notify:
+        if not any(status.enabled for status in results.values()) and self.notify and not notified_transition:
             await self.notify("AI: нет доступных настроенных провайдеров.")
         return results
 
