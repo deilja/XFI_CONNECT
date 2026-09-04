@@ -1,33 +1,33 @@
 """Connecting XFI CONNECT admin routers."""
-from aiogram import Router, F
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from bot.handlers.admin.main import router as main_router
-from bot.handlers.admin.message_editor import router as message_editor_router
-from bot.handlers.admin.servers import router as servers_router
-from bot.handlers.admin.payments import router as payments_router
-from bot.handlers.admin.cryptobot import router as cryptobot_router
-from bot.handlers.admin.tariffs import router as tariffs_router
 from bot.handlers.admin.broadcast import router as broadcast_router
 from bot.handlers.admin.broadcast_editor import router as broadcast_editor_router
-from bot.handlers.admin.users_list import router as users_list_router
-from bot.handlers.admin.users_manage import router as users_manage_router
+from bot.handlers.admin.code_editor import router as code_editor_router
+from bot.handlers.admin.coupon_generator import router as coupon_generator_router
+from bot.handlers.admin.coupons import router as coupons_router
+from bot.handlers.admin.cryptobot import router as cryptobot_router
+from bot.handlers.admin.customization_reset import router as customization_reset_router
+from bot.handlers.admin.dev_agent import router as dev_agent_router
+from bot.handlers.admin.groups import router as groups_router
+from bot.handlers.admin.main import router as main_router
+from bot.handlers.admin.message_editor import router as message_editor_router
+from bot.handlers.admin.payments import router as payments_router
+from bot.handlers.admin.promotions import router as promotions_router
+from bot.handlers.admin.referral import router as referral_router
+from bot.handlers.admin.servers import router as servers_router
+from bot.handlers.admin.support import router as support_router
+from bot.handlers.admin.system import router as system_router
+from bot.handlers.admin.tariffs import router as tariffs_router
+from bot.handlers.admin.trial import router as trial_router
 from bot.handlers.admin.users_keys import router as users_keys_router
 from bot.handlers.admin.users_keys_deleted import router as users_keys_deleted_router
-from bot.handlers.admin.system import router as system_router
-from bot.handlers.admin.trial import router as trial_router
-from bot.handlers.admin.referral import router as referral_router
-from bot.handlers.admin.promotions import router as promotions_router
-from bot.handlers.admin.coupons import router as coupons_router
-from bot.handlers.admin.coupon_generator import router as coupon_generator_router
-from bot.handlers.admin.groups import router as groups_router
-from bot.handlers.admin.support import router as support_router
-from bot.handlers.admin.customization_reset import router as customization_reset_router
-from bot.handlers.admin.code_editor import router as code_editor_router
-from bot.handlers.admin.dev_agent import router as dev_agent_router
-from bot.handlers.admin.yaa_local import router as yaa_local_router
+from bot.handlers.admin.users_list import router as users_list_router
+from bot.handlers.admin.users_manage import router as users_manage_router
 from bot.handlers.admin.xfi_ai_token import router as xfi_ai_token_router
+from bot.handlers.admin.yaa_local import router as yaa_local_router
 
 admin_router = Router()
 
