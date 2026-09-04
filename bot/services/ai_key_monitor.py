@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
@@ -26,7 +27,7 @@ class ProviderHealth:
 
     @property
     def enabled(self) -> bool:
-        return self.configured and self.healthy and bool(self.models) and time.time() >= self.disabled_until
+        return self.configured and self.healthy and time.time() >= self.disabled_until
 
 
 class AIKeyHealthMonitor:
@@ -53,13 +54,16 @@ class AIKeyHealthMonitor:
                 return status
             try:
                 ok = bool(await self.check(provider))
-                models = []
+                models: list[str] = []
                 if ok and self.list_models is not None:
                     models = await self.list_models(provider)
                 status.models = tuple(sorted({m.strip() for m in models if m and m.strip()}))
-                import hashlib
-                status.model_fingerprint = hashlib.sha256("\n".join(status.models).encode()).hexdigest() if status.models else ""
-                status.healthy = ok and bool(status.models)
+                status.model_fingerprint = (
+                    hashlib.sha256("\n".join(status.models).encode()).hexdigest()
+                    if status.models
+                    else ""
+                )
+                status.healthy = ok and (self.list_models is None or bool(status.models))
                 if status.healthy:
                     status.failures = 0
                     status.last_error = None
