@@ -1,6 +1,9 @@
 """Admin command for configuring the XFI AI Gateway token."""
 
+from contextlib import suppress
+
 from aiogram import Router
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -38,11 +41,8 @@ async def set_ai_token(message: Message) -> None:
         return
 
     save_gateway_token(token)
-    try:
+    with suppress(TelegramBadRequest, TelegramForbiddenError):
         await message.delete()
-    except Exception:
-        # Deleting the command is best-effort: some chats/bots may not permit it.
-        pass
 
     await message.answer(
         "XFI AI токен проверен и сохранён.\n"
