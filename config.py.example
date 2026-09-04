@@ -17,6 +17,9 @@ XFI_AI_BASE_URL = os.getenv("XFI_AI_BASE_URL", "http://127.0.0.1:8091")
 XFI_AI_API_KEY = os.getenv("XFI_AI_API_KEY", "")
 XFI_AI_MODEL = os.getenv("XFI_AI_MODEL", "")
 XFI_AI_TIMEOUT = float(os.getenv("XFI_AI_TIMEOUT", "45"))
+# Server-side bootstrap credential. Never commit or expose it to Telegram/Web UI.
+XFI_CONNECT_BOOTSTRAP_TOKEN = os.getenv("XFI_CONNECT_BOOTSTRAP_TOKEN", "")
+XFI_AI_KEY_FILE = os.getenv("XFI_AI_KEY_FILE", "data/xfi_ai_api_key")
 
 DEFAULT_LIMIT_IP = 1
 DEFAULT_TOTAL_GB = 1024 * 1024 * 1024 * 1024
