@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 async def on_startup(bot: Bot):
     logger.info("XFI CONNECT запускается")
     run_migrations()
+    from bot.services.xfi_ai_bootstrap import bootstrap_xfi_ai
+    await bootstrap_xfi_ai()
     from bot.utils.user_ui_texts import load_user_ui_text_cache
     logger.info("User UI text cache loaded: %s entries", load_user_ui_text_cache())
     from bot.utils.page_renderer import validate_required_user_pages
