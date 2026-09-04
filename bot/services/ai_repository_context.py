@@ -42,3 +42,8 @@ class RepositoryContext:
                 continue
             files.append(f"===== {relative} =====\n{data.decode('utf-8', errors='replace')}")
         return "\n\n".join(files)
+
+
+def build_repository_context(root: str | Path, query: str = "") -> str:
+    """Return bounded repository contents for an AI planning request."""
+    return RepositoryContext(root).collect(query)
