@@ -105,8 +105,13 @@ class SupervisorConsensus:
             raise ValueError("Invalid risk")
         if not isinstance(data["files"], list) or not all(isinstance(x, str) for x in data["files"]):
             raise ValueError("Invalid file list")
-        confirmation = bool(data["requires_confirmation"]) or data["risk"] in {"high", "critical"}
-        return Plan(str(data["summary"]), data["risk"], str(data["rationale"]), tuple(data["files"]), confirmation)
+        return Plan(
+            str(data["summary"]),
+            data["risk"],
+            str(data["rationale"]),
+            tuple(data["files"]),
+            True,
+        )
 
     @staticmethod
     def _select(plans: list[Plan]) -> Plan:
