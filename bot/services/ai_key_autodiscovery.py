@@ -5,9 +5,9 @@ successfully. Only providers explicitly registered here are probed.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import asyncio
 import re
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 import httpx
@@ -48,12 +48,16 @@ async def probe_api_key(probe: ProviderProbe, api_key: str, timeout: float = 8.0
 
 
 async def autodetect_provider(api_key: str, timeout: float = 8.0) -> str | None:
-    """Return the provider only after an authenticated 200 response."""
+    """Return the provider only when exactly one registered probe succeeds."""
     if not _looks_like_key(api_key):
         return None
-    candidates = [p for p in PROBES if not p.prefix or api_key.startswith(p.prefix)]
-    if not candidates:
-        candidates = list(PROBES)
-    results = await asyncio.gather(*(probe_api_key(p, api_key, timeout) for p in candidates), return_exceptions=True)
-    matches = [probe.provider for probe, result in zip(candidates, results) if result is True]
+    results = await asyncio.gather(
+        *(probe_api_key(probe, api_key, timeout) for probe in PROBES),
+        return_exceptions=True,
+    )
+    matches = [
+        probe.provider
+        for probe, result in zip(PROBES, results)
+        if result is True
+    ]
     return matches[0] if len(matches) == 1 else None
