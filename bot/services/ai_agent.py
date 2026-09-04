@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -42,17 +43,35 @@ class AIAgent:
     MAX_ATTEMPTS = 3
 
     def __init__(self, provider: str | None = None, key_store: AIKeyStore | None = None, inventory=None):
-        self.provider = (provider or "").strip().lower() or None
+        self.provider = self._normalize_provider(provider) if provider else None
         self.history: list[dict[str, str]] = []
         self.project_contract = _load_project_contract()
-        self.key_store = key_store or AIKeyStore("data/ai_keys.enc")
+        self.key_store = key_store
         self.inventory = inventory
         self.selector = AIModelSelector(inventory) if inventory is not None else None
         self._clients: dict[str, AsyncOpenAI] = {}
+        self._keystore_error: str | None = None
+        if self.key_store is None:
+            master_key = os.getenv("XFI_AI_KEYSTORE_MASTER_KEY", "")
+            if len(master_key) >= 32:
+                self.key_store = AIKeyStore("data/ai_keys.enc", master_key=master_key)
+            else:
+                self._keystore_error = "XFI_AI_KEYSTORE_MASTER_KEY is not configured"
         self._refresh_client()
+
+    @staticmethod
+    def _normalize_provider(provider: str) -> str:
+        aliases = {
+            "deepseek": "groq",
+            "openrouter": "groq",
+        }
+        normalized = provider.strip().lower()
+        return aliases.get(normalized, normalized)
 
     def _refresh_client(self) -> None:
         self._clients.clear()
+        if self.key_store is None:
+            return
         endpoints = {"groq": "https://api.groq.com/openai/v1", "grok": "https://api.x.ai/v1", "openai": None}
         for provider, base_url in endpoints.items():
             key = self.key_store.get(provider)
@@ -63,7 +82,7 @@ class AIAgent:
                 self._clients[provider] = AsyncOpenAI(**kwargs)
 
     def set_provider(self, provider: str) -> None:
-        provider = provider.strip().lower()
+        provider = self._normalize_provider(provider)
         if provider not in {"groq", "grok", "openai"}:
             raise ValueError(f"Неподдерживаемый AI-провайдер: {provider}")
         self.provider = provider
@@ -73,16 +92,22 @@ class AIAgent:
         self.history.clear()
 
     def _system_message(self, role: str, module_path: str | None = None) -> str:
-        return ("Ты AI-инженер и ассистент администратора проекта XFI CONNECT.\n\n"
-                "Анализируй причину и предлагай минимальное проверяемое изменение. "
-                "Не выдумывай состояние системы, CI, коммиты или выполненные действия.\n\n"
-                f"Текущий контекст: {role}\n\nКонтекст модуля:\n{context_for(module_path or role)}\n\n"
-                f"Общий контракт проекта:\n{self.project_contract}")
+        return (
+            "Ты AI-инженер и ассистент администратора проекта XFI CONNECT.\n\n"
+            "Анализируй причину и предлагай минимальное проверяемое изменение. "
+            "Не выдумывай состояние системы, CI, коммиты или выполненные действия.\n\n"
+            f"Текущий контекст: {role}\n\nКонтекст модуля:\n{context_for(module_path or role)}\n\n"
+            f"Общий контракт проекта:\n{self.project_contract}"
+        )
 
     def _candidate_choices(self, task_type: str) -> list[tuple[str, str]]:
         if self.selector is None:
             if self.provider and self.provider in self._clients:
-                defaults = {"groq": getattr(config, "GROQ_MODEL", ""), "grok": getattr(config, "GROK_MODEL", ""), "openai": getattr(config, "OPENAI_MODEL", "")}
+                defaults = {
+                    "groq": getattr(config, "GROQ_MODEL", ""),
+                    "grok": getattr(config, "GROK_MODEL", ""),
+                    "openai": getattr(config, "OPENAI_MODEL", ""),
+                }
                 return [(self.provider, defaults[self.provider])]
             return []
         available = self.inventory.available()
@@ -97,7 +122,14 @@ class AIAgent:
                 choices.append((selected.provider, selected.model))
         return choices
 
-    async def chat(self, prompt: str, *, role: str = "admin AI assistant", module_path: str | None = None, task_type: str = "analysis") -> str:
+    async def chat(
+        self,
+        prompt: str,
+        *,
+        role: str = "admin AI assistant",
+        module_path: str | None = None,
+        task_type: str = "analysis",
+    ) -> str:
         prompt = (prompt or "").strip()
         if not prompt:
             return "❌ Пустой запрос."
@@ -105,7 +137,11 @@ class AIAgent:
         choices = self._candidate_choices(task_type)[: self.MAX_ATTEMPTS]
         if not choices:
             return "❌ Нет доступного AI-провайдера или модели. Настройте рабочий ключ через /ai_keys."
-        messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_message(role, module_path)}, *self.history[-20:], {"role": "user", "content": prompt}]
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self._system_message(role, module_path)},
+            *self.history[-20:],
+            {"role": "user", "content": prompt},
+        ]
         failures: list[str] = []
         for provider, model in choices:
             client = self._clients.get(provider)
@@ -120,7 +156,6 @@ class AIAgent:
                     return answer
                 failures.append(f"{provider}:empty_response")
             except Exception as exc:
-                # Do not echo provider error details or key material to the admin.
                 logger.warning("AI request failed provider=%s error=%s", provider, type(exc).__name__)
                 failures.append(f"{provider}:{type(exc).__name__}")
                 continue
