@@ -37,13 +37,12 @@ def _base_url() -> str:
 
 
 def _apply_key(key: str) -> None:
-    # Keep the existing configuration contract; never log the credential.
     config.XFI_AI_API_KEY = key
     os.environ["XFI_AI_API_KEY"] = key
 
 
 async def bootstrap_xfi_ai() -> bool:
-    """Load an existing integration key or bootstrap one once using a server-side credential."""
+    """Load the protected integration credential or register it when absent/invalid."""
     base_url = _base_url()
     if not base_url:
         logger.info("XFI AI bootstrap skipped: XFI_AI_BASE_URL is not configured")
@@ -62,20 +61,16 @@ async def bootstrap_xfi_ai() -> bool:
             except httpx.HTTPError as exc:
                 logger.warning("XFI AI existing key health check failed: %s", type(exc).__name__)
 
-        bootstrap = os.getenv("XFI_CONNECT_BOOTSTRAP_TOKEN", "").strip()
+        bootstrap = os.getenv("XFI_CONNECT_REGISTRATION_TOKEN", "").strip()
         if not bootstrap:
-            logger.warning("XFI AI bootstrap unavailable: XFI_CONNECT_BOOTSTRAP_TOKEN is not configured")
+            logger.warning("XFI AI bootstrap unavailable: XFI_CONNECT_REGISTRATION_TOKEN is not configured")
             return False
 
-        payload = {
-            "integration_id": "xfi-connect",
-            "name": "XFI CONNECT",
-        }
         try:
             response = await client.post(
                 "/v1/integrations/register",
                 headers={"X-XFI-Registration-Token": bootstrap},
-                json=payload,
+                json={"integration_id": "xfi-connect", "name": "XFI_CONNECT"},
             )
             if not response.is_success:
                 logger.warning("XFI AI registration failed: HTTP %s", response.status_code)
