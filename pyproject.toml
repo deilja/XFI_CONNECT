@@ -9,7 +9,7 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-"bot/handlers/admin/xfi_ai_token.py" = ["B001"]
+"bot/handlers/admin/xfi_ai_token.py" = ["B001", "SIM105"]
 
 [tool.ruff.format]
 quote-style = "double"
