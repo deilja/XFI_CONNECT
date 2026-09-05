@@ -27,33 +27,29 @@ async def activate_native_trial(
     last_name: str | None = None,
     bot: Any = None,
 ) -> dict[str, Any]:
-    """Create the same native trial key used by the Telegram bot.
-
-    This intentionally uses XFI CONNECT's tariff/database/panel provisioning
-    path instead of creating a separate 3X-UI trial client.
-    """
+    """Create the same native trial key used by the Telegram bot."""
     if not isinstance(telegram_id, int) or telegram_id <= 0:
         return {"ok": False, "reason": "invalid_telegram_id"}
 
     async with _lock_for(telegram_id):
         from database.requests import (
-            get_or_create_user,
-            has_used_trial,
-            is_trial_enabled,
-            get_trial_tariff_id,
-            get_tariff_by_id,
+            complete_order,
             create_initial_vpn_key,
             create_pending_order,
-            complete_order,
-            update_vpn_key_config,
             find_order_by_order_id,
             get_key_details_for_user,
-            get_user_by_telegram_id,
+            get_or_create_user,
             get_servers_for_key,
+            get_tariff_by_id,
+            get_trial_tariff_id,
+            has_used_trial,
+            is_trial_enabled,
+            mark_trial_used,
+            update_vpn_key_config,
         )
         from bot.services.vpn_api import (
-            provision_client_on_server,
             get_subscription_url_for_key,
+            provision_client_on_server,
         )
         from bot.handlers.admin.users_keys import generate_unique_email
 
@@ -107,6 +103,7 @@ async def activate_native_trial(
                 "telegram_id": telegram_id,
                 "username": username,
             })
+            sub_id = uuid.uuid4().hex
             provisioned = await provision_client_on_server(
                 server_id=server["id"],
                 email=panel_email,
@@ -115,13 +112,14 @@ async def activate_native_trial(
                 limit_ip=tariff.get("max_ips", 1) or 1,
                 enable=True,
                 tg_id=str(telegram_id),
-                sub_id=uuid.uuid4().hex,
+                sub_id=sub_id,
                 subscription_mode=True,
             )
             if not provisioned.complete and not provisioned.attached_inbound_ids:
                 raise RuntimeError("Не удалось создать trial-клиента")
             if not provisioned.credential or provisioned.primary_inbound_id is None:
                 raise RuntimeError("Панель не вернула данные trial-клиента")
+            sub_id = provisioned.sub_id or sub_id
 
             update_vpn_key_config(
                 key_id=key_id,
@@ -129,7 +127,7 @@ async def activate_native_trial(
                 panel_inbound_id=provisioned.primary_inbound_id,
                 panel_email=panel_email,
                 client_uuid=provisioned.credential,
-                sub_id=provisioned.sub_id,
+                sub_id=sub_id,
             )
             from bot.services.key_lifecycle import emit_key_lifecycle_event_safe
             await emit_key_lifecycle_event_safe(
@@ -142,16 +140,13 @@ async def activate_native_trial(
                     "server_id": server["id"],
                     "panel_inbound_id": provisioned.primary_inbound_id,
                     "panel_email": panel_email,
-                    "sub_id": provisioned.sub_id,
+                    "sub_id": sub_id,
                     "subscription_mode": True,
                     "source": "web_trial",
                 },
             )
 
-            # Mark the native user trial only after successful panel provisioning.
-            from database.requests import mark_trial_used
             mark_trial_used(internal_user_id)
-
             key_data = get_key_details_for_user(key_id, telegram_id)
             subscription_url = await get_subscription_url_for_key(key_data)
             if not subscription_url:
@@ -179,7 +174,6 @@ async def activate_native_trial(
             }
         except Exception:
             logger.exception("Native web trial provisioning failed for telegram_id=%s", telegram_id)
-            # The order/key remain auditable; the trial flag was not consumed.
             return {"ok": False, "reason": "provisioning_failed"}
 
 
