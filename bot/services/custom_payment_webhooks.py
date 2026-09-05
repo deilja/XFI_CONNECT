@@ -1,6 +1,7 @@
 """HTTP endpoints for custom payment providers and Trial VPN events."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -136,7 +137,6 @@ def _verify_telegram_webapp_init_data(init_data: str) -> dict[str, Any] | None:
         bot_token = ''
     if not bot_token:
         return None
-
     parsed = parse_qs(init_data, keep_blank_values=True)
     received_hash = (parsed.get('hash') or [''])[0]
     auth_date_raw = (parsed.get('auth_date') or [''])[0]
@@ -148,18 +148,15 @@ def _verify_telegram_webapp_init_data(init_data: str) -> dict[str, Any] | None:
         return None
     if auth_date <= 0 or abs(int(time.time()) - auth_date) > 86400:
         return None
-
     pairs = []
     for key in sorted(parsed):
-        if key == 'hash':
-            continue
-        pairs.append(f"{key}={(parsed[key] or [''])[0]}")
+        if key != 'hash':
+            pairs.append(f"{key}={(parsed[key] or [''])[0]}")
     data_check_string = '\n'.join(pairs)
     secret_key = hmac.new(b'WebAppData', bot_token.encode(), hashlib.sha256).digest()
     expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(received_hash, expected_hash):
         return None
-
     raw_user = (parsed.get('user') or [''])[0]
     try:
         user = json.loads(raw_user)
@@ -181,7 +178,6 @@ async def _trial_vpn_claim_handler(request: web.Request) -> web.Response:
     provided = request.headers.get('X-XFI-Webhook-Secret', '')
     if not hmac.compare_digest(provided, secret):
         return web.json_response({'ok': False, 'reason': 'forbidden'}, status=403)
-
     try:
         payload = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -189,7 +185,6 @@ async def _trial_vpn_claim_handler(request: web.Request) -> web.Response:
     user = _verify_telegram_webapp_init_data(str(payload.get('initData') or ''))
     if not user:
         return web.json_response({'ok': False, 'reason': 'invalid_telegram_auth'}, status=401)
-
     from bot.services.trial_claim import activate_native_trial
     result = await activate_native_trial(
         int(user['id']),
@@ -204,7 +199,10 @@ async def _trial_vpn_claim_handler(request: web.Request) -> web.Response:
 
 async def _payment_webhook_handler(request: web.Request) -> web.Response:
     provider_id = str(request.match_info.get('provider_id') or '')
-    from bot.utils.payment_provider_registry import get_payment_provider, validate_payment_webhook_secret
+    from bot.utils.payment_provider_registry import (
+        get_payment_provider,
+        validate_payment_webhook_secret,
+    )
     try:
         provider = get_payment_provider(provider_id)
     except ValueError:
@@ -231,10 +229,8 @@ async def _build_request_context(request: web.Request, provider_id: str) -> dict
     json_payload = None
     form_payload: dict[str, Any] = {}
     if content_type == 'application/json' and body_text:
-        try:
+        with contextlib.suppress(json.JSONDecodeError):
             json_payload = json.loads(body_text)
-        except json.JSONDecodeError:
-            pass
     elif content_type == 'application/x-www-form-urlencoded' and body_text:
         parsed = parse_qs(body_text, keep_blank_values=True)
         form_payload = {key: values[0] if len(values) == 1 else values for key, values in parsed.items()}
