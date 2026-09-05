@@ -13,7 +13,20 @@ Telegram-бот и backend VPN-сервиса XFI для управления п
 - безопасная настройка XFI AI API token через `/ai_token`;
 - поддержка клиентских приложений Happ, Hiddify Next, v2RayTun, Amnezia и Incy;
 - инструкции пользователю по подключению и импорту подписки;
-- Telegram support workflow.
+- Telegram support workflow;
+- приём событий Trial VPN через существующий webhook backend без отдельного Telegram Bot Token.
+
+## Trial VPN
+
+После выдачи тестовой подписки сервис `deilja/trial-vpn` может отправить событие в существующий XFI CONNECT backend. Trial VPN не хранит Telegram Bot Token и не отправляет сообщения в Telegram напрямую.
+
+Endpoint:
+
+```text
+POST /custom-payment-webhook/trial-vpn
+```
+
+Доступ защищается `TRIAL_VPN_WEBHOOK_SECRET`. После получения события XFI CONNECT использует существующий admin notification path. Подробная схема настройки: `docs/TRIAL_VPN_WEBHOOK.md`.
 
 ## XFI AI
 
@@ -83,66 +96,13 @@ GitHub Actions
 
 Прямые изменения `main` для этого сценария не выполняются. XFI AI работает через отдельную ветку и Pull Request.
 
-Основные команды XFI AI:
-
-```text
-/start
-/help
-/token
-/code
-/cancel
-```
-
-## Архитектура
-
-```text
-Telegram user
-      │
-      ▼
-XFI_CONNECT
-      │
-      ├── VPN subscriptions
-      ├── 3X-UI / X-UI integration
-      ├── Support handlers
-      └── XFI AI client
-               │
-               ▼
-         XFI AI Gateway
-               │
-       ┌───────┴────────┐
-       │ AI providers   │
-       │ failover       │
-       │ client keys    │
-       └────────────────┘
-
-XFI AI Code Agent
-      │
-      ▼
-GitHub API
-      │
-      ▼
-deilja/XFI_CONNECT
-      │
-      ▼
-Pull Request → CI
-```
-
 ## Клиенты
 
-Поддерживаются сценарии подключения через:
-
-- Happ;
-- Hiddify Next;
-- v2RayTun;
-- Amnezia;
-- Incy;
-- WireGuard-конфигурацию.
+Поддерживаются сценарии подключения через Happ, Hiddify Next, v2RayTun, Amnezia, Incy и WireGuard-конфигурацию.
 
 Для Incy предусмотрен автоматический импорт по ссылке подписки, где это поддерживается текущей конфигурацией бота.
 
 ## Переменные окружения XFI AI
-
-Основные параметры:
 
 ```env
 XFI_AI_BASE_URL=http://127.0.0.1:8091
@@ -157,11 +117,12 @@ XFI_AI_TIMEOUT=45
 ## Безопасность
 
 - XFI AI token проверяется до сохранения.
-- Входная команда с токеном удаляется после успешной настройки, если Telegram разрешает удаление.
 - Реальные ключи AI-провайдеров не передаются пользователям XFI CONNECT.
 - Административные команды проверяются через существующую admin authorization.
 - Code Agent не записывает изменения непосредственно в `main`.
 - Изменение кода выполняется только после явного подтверждения `ПОДТВЕРЖДАЮ`.
+- Trial VPN webhook защищён отдельным shared secret.
+- Trial VPN webhook не принимает и не пересылает subscription URL или UUID клиента.
 
 ## Разработка
 
@@ -195,21 +156,7 @@ python3 -m pytest -q
 
 ## CI
 
-GitHub Actions выполняет проверку Python-кода, compile check, lint и regression suite. Изменения, подготовленные XFI AI Code Agent, проходят тот же CI через Pull Request.
-
-## Структура интеграции
-
-```text
-bot/
-├── handlers/
-│   ├── ai.py
-│   └── admin/
-│       └── xfi_ai_token.py
-└── services/
-    └── xfi_ai_service.py
-```
-
-`bot/services/xfi_ai_service.py` отвечает за безопасную работу с XFI AI Gateway, а handlers предоставляют пользовательский и административный интерфейс.
+GitHub Actions выполняет проверку Python-кода, compile check, lint и regression suite.
 
 ## Связанные проекты
 
