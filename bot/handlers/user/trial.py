@@ -1,6 +1,7 @@
 import logging
+import os
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.fsm.context import FSMContext
 from bot.utils.action_dispatcher import (
     CoreActionRequest,
@@ -11,6 +12,20 @@ from bot.utils.action_dispatcher import (
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+
+def _trial_webapp_url() -> str:
+    return os.getenv('TRIAL_VPN_WEBAPP_URL', '').strip()
+
+
+def _trial_webapp_markup() -> InlineKeyboardMarkup | None:
+    url = _trial_webapp_url()
+    if not url or not url.startswith(('https://', 'http://')):
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🌐 Получить тест на сайте', web_app=WebAppInfo(url=url))],
+        [InlineKeyboardButton(text='🎁 Получить тест в боте', callback_data='trial_activate')],
+    ])
 
 
 @router.callback_query(F.data == 'trial_subscription')
@@ -36,6 +51,12 @@ async def show_trial_subscription(callback: CallbackQuery):
         return
 
     await render_page(callback, page_key='trial')
+    markup = _trial_webapp_markup()
+    if markup and callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=markup)
+        except Exception as exc:
+            logger.warning('Не удалось добавить Trial WebApp кнопку: %s', exc)
     await callback.answer()
 
 
@@ -114,7 +135,6 @@ async def _execute_trial_activate(request: CoreActionRequest) -> None:
     except Exception as hook_err:
         logger.warning(f"Не удалось вызвать lifecycle hooks trial-ключа {key_id}: {hook_err}")
 
-    # Notifying administrators about trial subscription activation
     try:
         from bot.services.notifications import notify_admins_payment
         from database.requests import find_order_by_order_id
