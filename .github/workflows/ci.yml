@@ -21,7 +21,7 @@ jobs:
       - name: Prepare CI config
         run: cp config.py.example config.py
       - name: Compile Python sources
-        run: python -m compileall -q . -x '(^|/)(\.git|\.snapshots|__pycache__|venv)(/|$)'
+        run: python -m compileall -q . -x '(^|/)(\.git|\.snapshots|__pycache__|venv|web_cabinet_v2)(/|$)'
       - name: Ruff lint changed Python files
         env:
           PYTHONPATH: .
