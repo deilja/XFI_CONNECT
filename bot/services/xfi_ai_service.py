@@ -16,6 +16,12 @@ except ValueError:
     XFI_AI_TIMEOUT = 45.0
 XFI_AI_TIMEOUT = min(max(XFI_AI_TIMEOUT, 5.0), 120.0)
 
+XFI_AI_TOKEN_FILE = Path(
+    os.getenv("XFI_AI_TOKEN_FILE")
+    or os.getenv("XFI_AI_KEY_FILE")
+    or getattr(config, "XFI_AI_KEY_FILE", "data/xfi_ai_api_key")
+)
+
 SYSTEM_PROMPT = """
 Ты — ИИ-ассистент технической поддержки VPN-сервиса XFI Connect.
 Помогай с WireGuard, AmneziaWG, VLESS/Reality, Xray, 3X-UI, Happ, Hiddify,
@@ -31,11 +37,12 @@ class XFIAIError(RuntimeError):
 
 
 def _base_url() -> str:
-    return str(getattr(config, "XFI_AI_BASE_URL", os.getenv("XFI_AI_BASE_URL", ""))).rstrip("/")
+    configured = str(getattr(config, "XFI_AI_BASE_URL", "")).strip()
+    return (configured or os.getenv("XFI_AI_BASE_URL", "")).rstrip("/")
 
 
 def _token_file() -> Path:
-    return Path(getattr(config, "XFI_AI_KEY_FILE", os.getenv("XFI_AI_KEY_FILE", "data/xfi_ai_api_key")))
+    return Path(XFI_AI_TOKEN_FILE)
 
 
 def get_gateway_token() -> str:
