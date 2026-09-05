@@ -37,8 +37,12 @@ class XFIAIError(RuntimeError):
 
 
 def _base_url() -> str:
-    configured = str(getattr(config, "XFI_AI_BASE_URL", "")).strip()
-    return (configured or os.getenv("XFI_AI_BASE_URL", "")).rstrip("/")
+    # Environment variables must override config.py defaults so deployments and tests
+    # can redirect the gateway without modifying the generated config.py file.
+    configured = os.getenv("XFI_AI_BASE_URL", "").strip()
+    if not configured:
+        configured = str(getattr(config, "XFI_AI_BASE_URL", "")).strip()
+    return configured.rstrip("/")
 
 
 def _token_file() -> Path:
@@ -52,6 +56,27 @@ def get_gateway_token() -> str:
     except OSError:
         token = os.getenv("XFI_AI_API_KEY", "").strip()
     return token if token.startswith("xfi_") and len(token) <= 512 else ""
+
+
+def save_gateway_token(token: str) -> None:
+    """Atomically store the gateway credential with owner-only permissions."""
+    token = token.strip()
+    if not token or not token.startswith("xfi_") or len(token) > 512:
+        raise XFIAIError("Invalid XFI AI Gateway token")
+    path = _token_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(f"{token}\n", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 async def verify_gateway_token(token: str) -> bool:
